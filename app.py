@@ -37,13 +37,14 @@ PREF_CENTERS = np.array([
     [31.911, 131.424], [31.560, 130.558], [26.212, 127.681]
 ], dtype=np.float32)
 
+PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
+
 @st.cache_data(show_spinner=False)
 def load_data():
-    file_id = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
     output = "small_area_slim.parquet"
 
     if not os.path.exists(output):
-        url = f"https://drive.google.com/uc?id={file_id}"
+        url = f"https://drive.google.com/uc?id={PARQUET_FILE_ID}"
         gdown.download(url, output, quiet=True)
 
     df = pd.read_parquet(output)
@@ -180,7 +181,6 @@ if not has_area_filter:
 elif not target_df.empty:
     center_lat = float(target_df["Y_CODE"].mean())
     center_lon = float(target_df["X_CODE"].mean())
-    # 市区町村まで絞ったらズーム13（最初からグリッド）、都道府県のみならズーム8（最初からヒートマップ）
     zoom_start = 13 if (selected_city != "（すべて）" or city_keyword.strip()) else 8
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
@@ -201,7 +201,6 @@ elif not target_df.empty:
         max_zoom=18
     ).add_to(m)
 
-    # 1. ヒートマップ用グループ
     fg_heat = folium.FeatureGroup(name="広域ヒートマップ", show=True)
     max_hm = 10000
     hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
@@ -219,7 +218,6 @@ elif not target_df.empty:
     ).add_to(fg_heat)
     fg_heat.add_to(m)
 
-    # 2. 詳細グリッド用グループ（OOM防止のため最大5,000件に制限）
     fg_grid = folium.FeatureGroup(name="詳細グリッド", show=True)
     max_grid = 5000
     if len(target_df) <= max_grid:
@@ -249,12 +247,11 @@ elif not target_df.empty:
         ).add_to(fg_grid)
     fg_grid.add_to(m)
 
-    # 3. ズームレベル（閾値: 12）に応じてヒートマップとグリッドを自動切替するJS
-    zoom_switch_js = f"""
+    zoom_switch_js = '''
     {% macro script(this, kwargs) %}
-    var map = {{this._parent.get_name()}};
-    var heatLayer = {{fg_heat.get_name()}};
-    var gridLayer = {{fg_grid.get_name()}};
+    var map = {{ this._parent.get_name() }};
+    var heatLayer = {{ fg_heat.get_name() }};
+    var gridLayer = {{ fg_grid.get_name() }};
 
     function toggleByZoom() {
         var z = map.getZoom();
@@ -270,7 +267,7 @@ elif not target_df.empty:
     map.on('zoomend', toggleByZoom);
     toggleByZoom();
     {% endmacro %}
-    """
+    '''
     macro = MacroElement()
     macro._template = Template(zoom_switch_js)
     m.get_root().add_child(macro)
