@@ -53,27 +53,34 @@ class ZoomHeatGridSwitcher(folium.MacroElement):
         map_var = "{{ this._parent.get_name() }}"
         heat_var = heat_layer.get_name()
         grid_var = grid_layer.get_name()
-        js_body = textwrap.dedent(f"""
+        raw_js = textwrap.dedent("""
             {% macro script(this, kwargs) %}
-            var map = {map_var};
-            var heatLayer = {heat_var};
-            var gridLayer = {grid_var};
+            var map = __MAP_VAR__;
+            var heatLayer = __HEAT_VAR__;
+            var gridLayer = __GRID_VAR__;
 
-            function toggleByZoom() {{
+            function toggleByZoom() {
                 var z = map.getZoom();
-                if (z >= {zoom_threshold}) {{
-                    if (map.hasLayer(heatLayer)) {{ map.removeLayer(heatLayer); }}
-                    if (!map.hasLayer(gridLayer)) {{ map.addLayer(gridLayer); }}
-                }} else {{
-                    if (map.hasLayer(gridLayer)) {{ map.removeLayer(gridLayer); }}
-                    if (!map.hasLayer(heatLayer)) {{ map.addLayer(heatLayer); }}
-                }}
-            }}
+                if (z >= __ZOOM_THRESHOLD__) {
+                    if (map.hasLayer(heatLayer)) { map.removeLayer(heatLayer); }
+                    if (!map.hasLayer(gridLayer)) { map.addLayer(gridLayer); }
+                } else {
+                    if (map.hasLayer(gridLayer)) { map.removeLayer(gridLayer); }
+                    if (!map.hasLayer(heatLayer)) { map.addLayer(heatLayer); }
+                }
+            }
 
             map.on('zoomend', toggleByZoom);
             toggleByZoom();
             {% endmacro %}
             """).strip()
+        js_body = (
+            raw_js
+            .replace("__MAP_VAR__", map_var)
+            .replace("__HEAT_VAR__", heat_var)
+            .replace("__GRID_VAR__", grid_var)
+            .replace("__ZOOM_THRESHOLD__", str(zoom_threshold))
+        )
         self._template = folium.Template(js_body)
 
 
