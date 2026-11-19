@@ -1,13 +1,11 @@
 import os
 import gc
-import textwrap
 import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
-from branca.element import MacroElement, Template
 import gdown
 
 st.set_page_config(page_title="GIS・商圏分析システム MVP", layout="wide")
@@ -39,37 +37,6 @@ PREF_CENTERS = np.array([
 ], dtype=np.float32)
 
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
-
-
-class ZoomLayerSwitcher(MacroElement):
-    def __init__(self, heat_layer, grid_layer, zoom_threshold=12):
-        super().__init__()
-        self._name = "ZoomLayerSwitcher"
-        map_var = "{{ this._parent.get_name() }}"
-        heat_var = heat_layer.get_name()
-        grid_var = grid_layer.get_name()
-        js_body = textwrap.dedent(f'''
-        {{% macro script(this, kwargs) %}}
-        var map = {map_var};
-        var heatLayer = {heat_var};
-        var gridLayer = {grid_var};
-
-        function toggleByZoom() {{
-            var z = map.getZoom();
-            if (z >= {zoom_threshold}) {{
-                if (map.hasLayer(heatLayer)) {{ map.removeLayer(heatLayer); }}
-                if (!map.hasLayer(gridLayer)) {{ map.addLayer(gridLayer); }}
-            }} else {{
-                if (map.hasLayer(gridLayer)) {{ map.removeLayer(gridLayer); }}
-                if (!map.hasLayer(heatLayer)) {{ map.addLayer(heatLayer); }}
-            }}
-        }}
-
-        map.on('zoomend', toggleByZoom);
-        toggleByZoom();
-        {{% endmacro %}}
-        ''').strip()
-        self._template = Template(js_body)
 
 
 @st.cache_data(show_spinner=False)
@@ -120,6 +87,26 @@ def load_data():
     gc.collect()
     return df
 
+
+def add_base_tiles(m):
+    folium.TileLayer(
+        tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
+        attr="地理院タイル（淡色地図）",
+        name="国土地理院 淡色地図",
+        overlay=False,
+        control=True,
+        max_zoom=18
+    ).add_to(m)
+    folium.TileLayer(
+        tiles="https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+        attr="地理院タイル（標準地図）",
+        name="国土地理院 標準地図",
+        overlay=False,
+        control=True,
+        max_zoom=18
+    ).add_to(m)
+
+
 with st.spinner("軽量データを読み込んでいます..."):
     df = load_data()
 
@@ -148,7 +135,7 @@ else:
 filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
 selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
-st.sidebar.caption("表示スタイル：自動（広域ズーム：ヒートマップ / 拡大ズーム：グリッド）")
+st.sidebar.caption("表示スタイル：ヒートマップ＋対象エリア境界線")
 
 has_area_filter = (
     selected_pref != "（すべて）"
@@ -189,52 +176,44 @@ col4.metric("対象エリア数", f"{len(target_df):,} 件")
 st.markdown("---")
 
 if not has_area_filter:
-    st.info("左のサイドバーから「都道府県」または「市区町村」を選択・入力すると、対象エリアのヒートマップ／グリッドが表示されます。")
+    st.info("左のサイドバーから「都道府県」または「市区町村」を選択・入力すると、対象エリアのヒートマップと境界線が表示されます。")
     m = folium.Map(location=[36.5, 138.0], zoom_start=5, tiles=None)
-    folium.TileLayer(
-        tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
-        attr="地理院タイル（淡色地図）",
-        name="国土地理院 淡色地図",
-        overlay=False,
-        control=True,
-        max_zoom=18
-    ).add_to(m)
-    folium.TileLayer(
-        tiles="https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
-        attr="地理院タイル（標準地図）",
-        name="国土地理院 標準地図",
-        overlay=False,
-        control=True,
-        max_zoom=18
-    ).add_to(m)
+    add_base_tiles(m)
     folium.LayerControl().add_to(m)
     st_folium(m, width="100%", height=650, returned_objects=[])
     del m
     gc.collect()
 elif not target_df.empty:
-    center_lat = float(target_df["Y_CODE"].mean())
-    center_lon = float(target_df["X_CODE"].mean())
-    zoom_start = 13 if (selected_city != "（すべて）" or city_keyword.strip()) else 8
+    min_lat, max_lat = float(target_df["Y_CODE"].min()), float(target_df["Y_CODE"].max())
+    min_lon, max_lon = float(target_df["X_CODE"].min()), float(target_df["X_CODE"].max())
+    center_lat = (min_lat + max_lat) / 2.0
+    center_lon = (min_lon + max_lon) / 2.0
+    zoom_start = 12 if (selected_city != "（すべて）" or city_keyword.strip()) else 8
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
-    folium.TileLayer(
-        tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
-        attr="地理院タイル（淡色地図）",
-        name="国土地理院 淡色地図",
-        overlay=False,
-        control=True,
-        max_zoom=18
-    ).add_to(m)
-    folium.TileLayer(
-        tiles="https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
-        attr="地理院タイル（標準地図）",
-        name="国土地理院 標準地図",
-        overlay=False,
-        control=True,
-        max_zoom=18
+    add_base_tiles(m)
+
+    # 対象エリアの範囲境界線を表示
+    pad_lat = max((max_lat - min_lat) * 0.02, 0.001)
+    pad_lon = max((max_lon - min_lon) * 0.02, 0.001)
+    boundary_coords = [
+        [min_lat - pad_lat, min_lon - pad_lon],
+        [min_lat - pad_lat, max_lon + pad_lon],
+        [max_lat + pad_lat, max_lon + pad_lon],
+        [max_lat + pad_lat, min_lon - pad_lon],
+    ]
+    folium.Polygon(
+        locations=boundary_coords,
+        color="#d9381e",
+        weight=2.5,
+        dash_array="6, 4",
+        fill=True,
+        fill_color="#d9381e",
+        fill_opacity=0.04,
+        tooltip=f"{area_label} 境界範囲"
     ).add_to(m)
 
-    fg_heat = folium.FeatureGroup(name="広域ヒートマップ", show=True)
+    # ヒートマップのみ表示
     max_hm = 10000
     hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
     heat_data = list(zip(
@@ -248,39 +227,7 @@ elif not target_df.empty:
         blur=15,
         max_zoom=18,
         gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
-    ).add_to(fg_heat)
-    fg_heat.add_to(m)
-
-    fg_grid = folium.FeatureGroup(name="詳細グリッド", show=True)
-    max_grid = 5000
-    if len(target_df) <= max_grid:
-        grid_df = target_df
-    else:
-        grid_df = target_df.nlargest(max_grid, "JINKO")
-        st.caption(f"※ 対象が{len(target_df):,}件と多いため、拡大時の詳細グリッドは人口上位{max_grid:,}件を表示します（市区町村まで絞ると全件表示されます）。")
-
-    dlat, dlon = 0.0006, 0.0008
-    for row in grid_df.itertuples():
-        lat, lon = float(row.Y_CODE), float(row.X_CODE)
-        jinko, setai = int(row.JINKO), int(row.SETAI)
-        s_name = str(row.S_NAME) if hasattr(row, "S_NAME") else "不明"
-        city_n = str(row.CITY_NAME)
-
-        fill_col = "#e31a1c" if jinko >= 500 else ("#fd8d3c" if jinko >= 200 else ("#fecc5c" if jinko >= 50 else "#ffffb2"))
-        popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
-
-        folium.Rectangle(
-            bounds=[[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]],
-            color="#e67e22",
-            weight=0.5,
-            fill=True,
-            fill_color=fill_col,
-            fill_opacity=0.65,
-            popup=folium.Popup(popup_html, max_width=250)
-        ).add_to(fg_grid)
-    fg_grid.add_to(m)
-
-    m.get_root().add_child(ZoomLayerSwitcher(fg_heat, fg_grid, zoom_threshold=12))
+    ).add_to(m)
 
     folium.LayerControl().add_to(m)
     st_folium(m, width="100%", height=650, returned_objects=[])
