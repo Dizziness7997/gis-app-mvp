@@ -1,5 +1,6 @@
 import os
 import gc
+import json
 import textwrap
 import streamlit as st
 import pandas as pd
@@ -39,59 +40,7 @@ PREF_CENTERS = np.array([
 ], dtype=np.float32)
 
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
-
-
-def filter_spatial_outliers(df_sub: pd.DataFrame, max_deg_from_median: float = 2.0) -> pd.DataFrame:
-    # Remove far spatial outliers from area bounds/hull calculations
-    if len(df_sub) < 10:
-        return df_sub
-    med_lat = float(df_sub["Y_CODE"].median())
-    med_lon = float(df_sub["X_CODE"].median())
-    d_lat = (df_sub["Y_CODE"].to_numpy(dtype=np.float64) - med_lat) ** 2
-    d_lon = (df_sub["X_CODE"].to_numpy(dtype=np.float64) - med_lon) ** 2
-    dist = np.sqrt(d_lat + d_lon)
-    keep_mask = dist <= max_deg_from_median
-    if int(keep_mask.sum()) >= 3:
-        return df_sub.loc[keep_mask]
-    return df_sub
-
-
-def compute_convex_hull(points_yx: np.ndarray) -> list:
-    # Compute convex hull polygon coordinates from [lat, lon] array without external libs
-    if len(points_yx) == 0:
-        return []
-    unique_pts = np.unique(np.round(points_yx.astype(np.float64), 5), axis=0)
-    if len(unique_pts) <= 2:
-        pts = unique_pts
-    else:
-        order = np.lexsort((unique_pts[:, 0], unique_pts[:, 1]))
-        pts_sorted = unique_pts[order]
-
-        def cross(o, a, b):
-            return (a[1] - o[1]) * (b[0] - o[0]) - (a[0] - o[0]) * (b[1] - o[1])
-
-        lower = []
-        for p in pts_sorted:
-            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
-                lower.pop()
-            lower.append(p)
-
-        upper = []
-        for p in reversed(pts_sorted):
-            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
-                upper.pop()
-            upper.append(p)
-
-        hull = lower[:-1] + upper[:-1]
-        pts = np.array(hull) if len(hull) >= 3 else unique_pts
-
-    center = pts.mean(axis=0)
-    expanded = []
-    for y, x in pts:
-        dy = y - center[0]
-        dx = x - center[1]
-        expanded.append([float(y + dy * 0.02), float(x + dx * 0.02)])
-    return expanded
+GEOJSON_FILE_ID = "13LAo42gRdBajjeaT95Xx0x8krjlfINFj"
 
 
 class ZoomHeatGridSwitcher(MacroElement):
@@ -174,6 +123,55 @@ def load_data():
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_boundaries():
+    output = "admin_boundaries_slim.geojson"
+    if not os.path.exists(output):
+        url = f"https://drive.google.com/uc?id={GEOJSON_FILE_ID}"
+        gdown.download(url, output, quiet=True)
+
+    if not os.path.exists(output):
+        return {"type": "FeatureCollection", "features": []}
+
+    with open(output, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and isinstance(data.get("features"), list):
+        return data
+    return {"type": "FeatureCollection", "features": []}
+
+
+def filter_boundary_features(boundaries_data, selected_pref, pref_kw, selected_city, city_kw, available_prefs, city_candidates):
+    features = boundaries_data.get("features", [])
+    matched = []
+
+    matched_prefs = set()
+    if selected_pref != "（すべて）":
+        matched_prefs.add(selected_pref)
+    elif pref_kw.strip():
+        matched_prefs.update(p for p in available_prefs if pref_kw.strip() in p)
+
+    matched_cities = set()
+    if selected_city != "（すべて）":
+        matched_cities.add(selected_city)
+    elif city_kw.strip():
+        matched_cities.update(c for c in city_candidates if city_kw.strip() in c)
+
+    for feat in features:
+        props = feat.get("properties") or {}
+        p_val = str(props.get("PREF_NAME") or props.get("N03_001") or "")
+        c_val = str(props.get("CITY_NAME") or props.get("N03_004") or "")
+
+        if matched_cities:
+            if c_val in matched_cities and (not matched_prefs or p_val in matched_prefs):
+                matched.append(feat)
+        elif matched_prefs:
+            if p_val in matched_prefs:
+                matched.append(feat)
+
+    return {"type": "FeatureCollection", "features": matched}
+
+
 def add_base_tiles(m):
     folium.TileLayer(
         tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
@@ -193,8 +191,9 @@ def add_base_tiles(m):
     ).add_to(m)
 
 
-with st.spinner("軽量データを読み込んでいます..."):
+with st.spinner("軽量データと行政界データを読み込んでいます..."):
     df = load_data()
+    boundaries_data = load_boundaries()
 
 st.sidebar.header("🔍 エリア絞り込み")
 
@@ -221,7 +220,7 @@ else:
 filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
 selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
-st.sidebar.caption("表示：広域はヒートマップ＋外枠 / 拡大（ズーム13以上）はグリッド（クリックで地図内ポップアップ）")
+st.sidebar.caption("行政界：都道府県/市区町村ポリゴン / 拡大（ズーム13以上）でグリッド＋ポップアップ")
 
 has_area_filter = (
     selected_pref != "（すべて）"
@@ -264,7 +263,7 @@ col4.metric("対象エリア数", f"{len(target_df):,} 件")
 st.markdown("---")
 
 if not has_area_filter:
-    st.info("左のサイドバーから「都道府県」または「市区町村」を選択・入力すると、対象エリアのヒートマップと外枠が表示されます。")
+    st.info("左のサイドバーから「都道府県」または「市区町村」を選択・入力すると、対象エリアの行政界とヒートマップが表示されます。")
     m = folium.Map(location=[36.5, 138.0], zoom_start=5, tiles=None)
     add_base_tiles(m)
     folium.LayerControl().add_to(m)
@@ -272,33 +271,45 @@ if not has_area_filter:
     del m
     gc.collect()
 elif not target_df.empty:
-    clean_df = filter_spatial_outliers(target_df, max_deg_from_median=2.0)
-    coords_yx = clean_df[["Y_CODE", "X_CODE"]].to_numpy(dtype=np.float32)
-    center_lat = float(np.median(coords_yx[:, 0]))
-    center_lon = float(np.median(coords_yx[:, 1]))
+    center_lat = float(target_df["Y_CODE"].median())
+    center_lon = float(target_df["X_CODE"].median())
     zoom_start = 13 if is_city_selected else 8
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
     add_base_tiles(m)
 
-    # 1. 都道府県・市区町村の分布に沿った多角形外枠
-    hull_coords = compute_convex_hull(coords_yx)
-    if len(hull_coords) >= 3:
-        folium.Polygon(
-            locations=hull_coords,
-            color="#d9381e",
-            weight=2.5,
-            dash_array="6, 4",
-            fill=True,
-            fill_color="#d9381e",
-            fill_opacity=0.04,
-            tooltip=f"{area_label} 外枠"
+    # 1. 実際の都道府県・市区町村の行政界ポリゴン
+    matched_fc = filter_boundary_features(
+        boundaries_data,
+        selected_pref,
+        pref_keyword,
+        selected_city,
+        city_keyword,
+        available_prefs,
+        city_candidates,
+    )
+    if matched_fc["features"]:
+        folium.GeoJson(
+            matched_fc,
+            name="行政界（都道府県・市区町村）",
+            style_function=lambda _: {
+                "color": "#c0392b",
+                "weight": 2.0,
+                "opacity": 0.9,
+                "fillColor": "#c0392b",
+                "fillOpacity": 0.04,
+            },
+            tooltip=folium.GeoJsonTooltip(
+                fields=[k for k in ["PREF_NAME", "CITY_NAME"] if any(k in (f.get("properties") or {}) for f in matched_fc["features"])],
+                aliases=["都道府県", "市区町村"],
+                localize=True,
+            ),
         ).add_to(m)
 
     # 2. ヒートマップレイヤー（広域ズーム用）
     fg_heat = folium.FeatureGroup(name="広域ヒートマップ", show=True)
     max_hm = 10000
-    hm_df = clean_df if len(clean_df) <= max_hm else clean_df.sample(max_hm, random_state=42)
+    hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
     heat_data = list(zip(
         hm_df["Y_CODE"].astype(float).tolist(),
         hm_df["X_CODE"].astype(float).tolist(),
@@ -316,10 +327,10 @@ elif not target_df.empty:
     # 3. グリッドレイヤー（拡大ズーム13以上用・クリックで地図内ポップアップ表示）
     fg_grid = folium.FeatureGroup(name="詳細グリッド", show=False)
     max_grid = 2500
-    if len(clean_df) <= max_grid:
-        grid_df = clean_df
+    if len(target_df) <= max_grid:
+        grid_df = target_df
     else:
-        grid_df = clean_df.nlargest(max_grid, "JINKO")
+        grid_df = target_df.nlargest(max_grid, "JINKO")
 
     dlat, dlon = 0.0006, 0.0008
     for row in grid_df.itertuples():
