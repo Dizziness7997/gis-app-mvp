@@ -4,6 +4,7 @@ import numpy as np
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
+from branca.element import MacroElement, Template
 import os
 import gc
 import gdown
@@ -113,7 +114,7 @@ else:
 filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
 selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
-st.sidebar.caption("表示スタイル：自動（広域はヒートマップ / 詳細はグリッド）")
+st.sidebar.caption("表示スタイル：自動（広域ズーム：ヒートマップ / 拡大ズーム：グリッド）")
 
 has_area_filter = (
     selected_pref != "（すべて）"
@@ -179,7 +180,8 @@ if not has_area_filter:
 elif not target_df.empty:
     center_lat = float(target_df["Y_CODE"].mean())
     center_lon = float(target_df["X_CODE"].mean())
-    zoom_start = 13 if selected_city != "（すべて）" else (8 if selected_pref != "（すべて）" else 7)
+    # 市区町村まで絞ったらズーム13（最初からグリッド）、都道府県のみならズーム8（最初からヒートマップ）
+    zoom_start = 13 if (selected_city != "（すべて）" or city_keyword.strip()) else 8
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
     folium.TileLayer(
@@ -199,42 +201,79 @@ elif not target_df.empty:
         max_zoom=18
     ).add_to(m)
 
-    if len(target_df) > 1500:
-        max_hm = 10000
-        hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
-        heat_data = list(zip(
-            hm_df["Y_CODE"].astype(float).tolist(),
-            hm_df["X_CODE"].astype(float).tolist(),
-            np.maximum(hm_df["JINKO"].astype(float).values, 1.0).tolist()
-        ))
-        HeatMap(
-            heat_data,
-            radius=18 if len(hm_df) > 3000 else 22,
-            blur=15,
-            max_zoom=13,
-            gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
-        ).add_to(m)
+    # 1. ヒートマップ用グループ
+    fg_heat = folium.FeatureGroup(name="広域ヒートマップ", show=True)
+    max_hm = 10000
+    hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
+    heat_data = list(zip(
+        hm_df["Y_CODE"].astype(float).tolist(),
+        hm_df["X_CODE"].astype(float).tolist(),
+        np.maximum(hm_df["JINKO"].astype(float).values, 1.0).tolist()
+    ))
+    HeatMap(
+        heat_data,
+        radius=18 if len(hm_df) > 3000 else 22,
+        blur=15,
+        max_zoom=18,
+        gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
+    ).add_to(fg_heat)
+    fg_heat.add_to(m)
+
+    # 2. 詳細グリッド用グループ（OOM防止のため最大5,000件に制限）
+    fg_grid = folium.FeatureGroup(name="詳細グリッド", show=True)
+    max_grid = 5000
+    if len(target_df) <= max_grid:
+        grid_df = target_df
     else:
-        grid_df = target_df if len(target_df) <= 1500 else target_df.head(1500)
-        dlat, dlon = 0.0006, 0.0008
-        for row in grid_df.itertuples():
-            lat, lon = float(row.Y_CODE), float(row.X_CODE)
-            jinko, setai = int(row.JINKO), int(row.SETAI)
-            s_name = str(row.S_NAME) if hasattr(row, "S_NAME") else "不明"
-            city_n = str(row.CITY_NAME)
+        grid_df = target_df.nlargest(max_grid, "JINKO")
+        st.caption(f"※ 対象が{len(target_df):,}件と多いため、拡大時の詳細グリッドは人口上位{max_grid:,}件を表示します（市区町村まで絞ると全件表示されます）。")
 
-            fill_col = "#e31a1c" if jinko >= 500 else ("#fd8d3c" if jinko >= 200 else ("#fecc5c" if jinko >= 50 else "#ffffb2"))
-            popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
+    dlat, dlon = 0.0006, 0.0008
+    for row in grid_df.itertuples():
+        lat, lon = float(row.Y_CODE), float(row.X_CODE)
+        jinko, setai = int(row.JINKO), int(row.SETAI)
+        s_name = str(row.S_NAME) if hasattr(row, "S_NAME") else "不明"
+        city_n = str(row.CITY_NAME)
 
-            folium.Rectangle(
-                bounds=[[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]],
-                color="#e67e22",
-                weight=0.5,
-                fill=True,
-                fill_color=fill_col,
-                fill_opacity=0.65,
-                popup=folium.Popup(popup_html, max_width=250)
-            ).add_to(m)
+        fill_col = "#e31a1c" if jinko >= 500 else ("#fd8d3c" if jinko >= 200 else ("#fecc5c" if jinko >= 50 else "#ffffb2"))
+        popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
+
+        folium.Rectangle(
+            bounds=[[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]],
+            color="#e67e22",
+            weight=0.5,
+            fill=True,
+            fill_color=fill_col,
+            fill_opacity=0.65,
+            popup=folium.Popup(popup_html, max_width=250)
+        ).add_to(fg_grid)
+    fg_grid.add_to(m)
+
+    # 3. ズームレベル（閾値: 12）に応じてヒートマップとグリッドを自動切替するJS
+    zoom_switch_js = f"""
+    {% macro script(this, kwargs) %}
+    var map = {{this._parent.get_name()}};
+    var heatLayer = {{fg_heat.get_name()}};
+    var gridLayer = {{fg_grid.get_name()}};
+
+    function toggleByZoom() {
+        var z = map.getZoom();
+        if (z >= 12) {
+            if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
+            if (!map.hasLayer(gridLayer)) map.addLayer(gridLayer);
+        } else {
+            if (map.hasLayer(gridLayer)) map.removeLayer(gridLayer);
+            if (!map.hasLayer(heatLayer)) map.addLayer(heatLayer);
+        }
+    }
+
+    map.on('zoomend', toggleByZoom);
+    toggleByZoom();
+    {% endmacro %}
+    """
+    macro = MacroElement()
+    macro._template = Template(zoom_switch_js)
+    m.get_root().add_child(macro)
 
     folium.LayerControl().add_to(m)
     st_folium(m, width="100%", height=650, returned_objects=[])
