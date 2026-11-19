@@ -19,14 +19,41 @@ PREF_LIST = [
     "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
 ]
 
+PREFIX_TO_PREF = {
+    "札幌市": "北海道", "旭川市": "北海道", "函館市": "北海道",
+    "仙台市": "宮城県",
+    "さいたま市": "埼玉県",
+    "千葉市": "千葉県",
+    "千代田区": "東京都", "中央区": "東京都", "港区": "東京都", "新宿区": "東京都",
+    "文京区": "東京都", "台東区": "東京都", "墨田区": "東京都", "江東区": "東京都",
+    "品川区": "東京都", "目黒区": "東京都", "大田区": "東京都", "世田谷区": "東京都",
+    "渋谷区": "東京都", "中野区": "東京都", "杉並区": "東京都", "豊島区": "東京都",
+    "北区": "東京都", "荒川区": "東京都", "板橋区": "東京都", "練馬区": "東京都",
+    "足立区": "東京都", "葛飾区": "東京都", "江戸川区": "東京都", "八王子市": "東京都",
+    "横浜市": "神奈川県", "川崎市": "神奈川県", "相模原市": "神奈川県",
+    "新潟市": "新潟県",
+    "静岡市": "静岡県", "浜松市": "静岡県",
+    "名古屋市": "愛知県",
+    "京都市": "京都府",
+    "大阪市": "大阪府", "堺市": "大阪府",
+    "神戸市": "兵庫県",
+    "岡山市": "岡山県",
+    "広島市": "広島県",
+    "北九州市": "福岡県", "福岡市": "福岡県",
+    "熊本市": "熊本県",
+}
+
 def infer_pref(city_name: str) -> str:
-    if not isinstance(city_name, str):
+    if not isinstance(city_name, str) or not city_name:
         return ""
     if city_name.startswith("北海道"):
         return "北海道"
     for p in PREF_LIST:
         if city_name.startswith(p):
             return p
+    for prefix, pref in PREFIX_TO_PREF.items():
+        if city_name.startswith(prefix):
+            return pref
     return ""
 
 @st.cache_data
@@ -45,7 +72,6 @@ def load_data():
     df = df.dropna(subset=["X_CODE", "Y_CODE"])
     df["CITY_NAME"] = df["CITY_NAME"].astype(str)
 
-    # 都道府県カラムの確保
     pref_candidates = ["PREF_NAME", "KEN_NAME", "都道府県名", "都道府県"]
     found_pref_col = next((c for c in pref_candidates if c in df.columns), None)
     if found_pref_col:
@@ -62,26 +88,34 @@ if df.empty:
     st.error("データの読み込みに失敗しました。ファイルIDや共有設定をご確認ください。")
     st.stop()
 
-# ==========================================
-# サイドバー：都道府県＆市区町村の絞り込み（文字入力対応）
-# ==========================================
 st.sidebar.header("🔍 エリア絞り込み")
 
-# 1. 都道府県（文字入力検索 + 選択）
-pref_keyword = st.sidebar.text_input("都道府県を文字で絞り込み", placeholder="例：北海、東京、新潟")
-available_prefs = [p for p in PREF_LIST if p in set(df["PREF_NAME"].unique())]
-if not available_prefs:
-    available_prefs = sorted([p for p in df["PREF_NAME"].unique() if p])
+pref_keyword = st.sidebar.text_input(
+    "都道府県を文字で絞り込み",
+    placeholder="例：北海道、東京都、新潟県"
+)
 
-filtered_prefs = [p for p in available_prefs if pref_keyword.strip() in p] if pref_keyword.strip() else available_prefs
+data_prefs = set(p for p in df["PREF_NAME"].unique() if p)
+available_prefs = [p for p in PREF_LIST if p in data_prefs] if data_prefs else PREF_LIST[:]
+if not available_prefs:
+    available_prefs = PREF_LIST[:]
+
+if pref_keyword.strip():
+    filtered_prefs = [p for p in available_prefs if pref_keyword.strip() in p]
+else:
+    filtered_prefs = available_prefs
+
 pref_options = ["（すべて）"] + filtered_prefs
 selected_pref = st.sidebar.selectbox("都道府県を選択", pref_options, index=0)
 
-# 2. 市区町村（文字入力検索は都道府県選択前から可能／選択肢は都道府県絞り込みに連動）
-city_keyword = st.sidebar.text_input("市区町村を文字で絞り込み（都道府県未選択でも可）", placeholder="例：札幌、新宿、新潟市")
+city_keyword = st.sidebar.text_input(
+    "市区町村を文字で絞り込み（都道府県未選択でも可）",
+    placeholder="例：札幌市、新宿区、新潟市"
+)
 
 if selected_pref != "（すべて）":
-    base_city_df = df[df["PREF_NAME"] == selected_pref]
+    matched_pref_rows = df[df["PREF_NAME"] == selected_pref]
+    base_city_df = matched_pref_rows if not matched_pref_rows.empty else df
 else:
     base_city_df = df
 
@@ -94,34 +128,33 @@ else:
 city_options = ["（すべて）"] + filtered_cities
 selected_city = st.sidebar.selectbox("市区町村を選択", city_options, index=0)
 
-# 表示モード（広域ヒートマップ / 詳細メッシュ・グリッド）
 display_mode = st.sidebar.radio(
     "地図表示スタイル",
     ["自動（広域：ヒートマップ / 詳細：グリッド）", "ヒートマップ重視", "詳細グリッド重視"],
     index=0
 )
 
-# ==========================================
-# 対象データの抽出
-# ==========================================
 target_df = df.copy()
 if selected_pref != "（すべて）":
-    target_df = target_df[target_df["PREF_NAME"] == selected_pref]
+    pref_rows = target_df[target_df["PREF_NAME"] == selected_pref]
+    if not pref_rows.empty:
+        target_df = pref_rows
 elif pref_keyword.strip():
-    target_df = target_df[target_df["PREF_NAME"].str.contains(pref_keyword.strip(), na=False)]
+    kw_rows = target_df[target_df["PREF_NAME"].str.contains(pref_keyword.strip(), na=False)]
+    if not kw_rows.empty:
+        target_df = kw_rows
 
 if selected_city != "（すべて）":
     target_df = target_df[target_df["CITY_NAME"] == selected_city]
 elif city_keyword.strip():
     target_df = target_df[target_df["CITY_NAME"].str.contains(city_keyword.strip(), na=False)]
 
-# メトリクス表示
 total_jinko = target_df["JINKO"].sum()
 total_setai = target_df["SETAI"].sum()
 area_label = (
     f"{selected_pref} / {selected_city}"
     if selected_pref != "（すべて）" and selected_city != "（すべて）"
-    else (selected_city if selected_city != "（すべて）" else (selected_pref if selected_pref != "（すべて）" else "全国（絞り込み中）"))
+    else (selected_city if selected_city != "（すべて）" else (selected_pref if selected_pref != "（すべて）" else "全国"))
 )
 
 col1, col2, col3, col4 = st.columns(4)
@@ -132,14 +165,10 @@ col4.metric("対象エリア数", f"{len(target_df):,} 件")
 
 st.markdown("---")
 
-# ==========================================
-# Folium地図の描画（国土地理院タイル＋ヒートマップ/詳細グリッド）
-# ==========================================
 if not target_df.empty:
     center_lat = float(target_df["Y_CODE"].mean())
     center_lon = float(target_df["X_CODE"].mean())
 
-    # 対象件数に応じて初期ズームを調整
     if selected_city != "（すべて）":
         zoom_start = 13
     elif selected_pref != "（すべて）":
@@ -149,7 +178,6 @@ if not target_df.empty:
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
 
-    # 国土地理院 淡色地図（画像のような見やすいベース地図）＋標準地図＋OSM
     folium.TileLayer(
         tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
         attr="地理院タイル（淡色地図）",
@@ -174,7 +202,6 @@ if not target_df.empty:
     )
 
     if use_heatmap:
-        # 描画高速化のため、非常に多い場合はサンプリング
         hm_df = target_df if len(target_df) <= 50000 else target_df.sample(50000, random_state=42)
         heat_data = [
             [float(r["Y_CODE"]), float(r["X_CODE"]), float(max(r["JINKO"], 1))]
@@ -188,12 +215,11 @@ if not target_df.empty:
             gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
         ).add_to(m)
     else:
-        # 詳細表示：125mグリッド風の矩形＋人口に応じたマーカー（最大3,000件で描画保護）
         grid_df = target_df if len(target_df) <= 3000 else target_df.head(3000)
         if len(target_df) > 3000:
             st.info(f"表示件数が多いため上位3,000件を描画しています（全{len(target_df):,}件）。市区町村で絞り込むと全件表示されます。")
 
-        dlat = 0.0006  # 約125mメッシュ相当の半幅
+        dlat = 0.0006
         dlon = 0.0008
 
         for _, row in grid_df.iterrows():
@@ -204,7 +230,6 @@ if not target_df.empty:
             s_name = row["S_NAME"] if "S_NAME" in row and pd.notna(row["S_NAME"]) else "不明"
             city_n = row["CITY_NAME"]
 
-            # 人口に応じた色（黄〜橙〜赤）
             if jinko >= 500:
                 fill_col = "#e31a1c"
             elif jinko >= 200:
