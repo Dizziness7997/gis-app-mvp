@@ -1,11 +1,13 @@
 import os
 import gc
+import textwrap
 import streamlit as st
 import pandas as pd
 import numpy as np
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
+from branca.element import MacroElement, Template
 import gdown
 
 st.set_page_config(page_title="GIS・商圏分析システム MVP", layout="wide")
@@ -37,6 +39,37 @@ PREF_CENTERS = np.array([
 ], dtype=np.float32)
 
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
+
+
+class ZoomPointBorderSwitcher(MacroElement):
+    def __init__(self, points_layer, zoom_threshold=13):
+        super().__init__()
+        self._name = "ZoomPointBorderSwitcher"
+        map_var = "{{ this._parent.get_name() }}"
+        points_var = points_layer.get_name()
+        js_body = textwrap.dedent(f'''
+        {{% macro script(this, kwargs) %}}
+        var map = {map_var};
+        var pointsLayer = {points_var};
+
+        function togglePointBorders() {{
+            var z = map.getZoom();
+            if (z >= {zoom_threshold}) {{
+                if (!map.hasLayer(pointsLayer)) {{
+                    map.addLayer(pointsLayer);
+                }}
+            }} else {{
+                if (map.hasLayer(pointsLayer)) {{
+                    map.removeLayer(pointsLayer);
+                }}
+            }}
+        }}
+
+        map.on('zoomend', togglePointBorders);
+        togglePointBorders();
+        {{% endmacro %}}
+        ''').strip()
+        self._template = Template(js_body)
 
 
 @st.cache_data(show_spinner=False)
@@ -135,7 +168,7 @@ else:
 filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
 selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
-st.sidebar.caption("表示スタイル：ヒートマップ＋対象エリア境界線")
+st.sidebar.caption("境界線：都道府県/市区町村は外枠、拡大（ズーム13以上）で各粒の外枠を表示")
 
 has_area_filter = (
     selected_pref != "（すべて）"
@@ -143,6 +176,8 @@ has_area_filter = (
     or bool(pref_keyword.strip())
     or bool(city_keyword.strip())
 )
+
+is_city_selected = (selected_city != "（すべて）") or bool(city_keyword.strip())
 
 mask = pd.Series(True, index=df.index)
 if selected_pref != "（すべて）":
@@ -188,32 +223,32 @@ elif not target_df.empty:
     min_lon, max_lon = float(target_df["X_CODE"].min()), float(target_df["X_CODE"].max())
     center_lat = (min_lat + max_lat) / 2.0
     center_lon = (min_lon + max_lon) / 2.0
-    zoom_start = 12 if (selected_city != "（すべて）" or city_keyword.strip()) else 8
+    zoom_start = 12 if is_city_selected else 8
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
     add_base_tiles(m)
 
-    # 対象エリアの範囲境界線を表示
+    # 1. 対象エリア（都道府県 または 市区町村）の外枠
     pad_lat = max((max_lat - min_lat) * 0.02, 0.001)
     pad_lon = max((max_lon - min_lon) * 0.02, 0.001)
-    boundary_coords = [
+    outer_coords = [
         [min_lat - pad_lat, min_lon - pad_lon],
         [min_lat - pad_lat, max_lon + pad_lon],
         [max_lat + pad_lat, max_lon + pad_lon],
         [max_lat + pad_lat, min_lon - pad_lon],
     ]
     folium.Polygon(
-        locations=boundary_coords,
+        locations=outer_coords,
         color="#d9381e",
         weight=2.5,
         dash_array="6, 4",
         fill=True,
         fill_color="#d9381e",
-        fill_opacity=0.04,
-        tooltip=f"{area_label} 境界範囲"
+        fill_opacity=0.03,
+        tooltip=f"{area_label} 外枠"
     ).add_to(m)
 
-    # ヒートマップのみ表示
+    # 2. ヒートマップレイヤー
     max_hm = 10000
     hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
     heat_data = list(zip(
@@ -228,6 +263,32 @@ elif not target_df.empty:
         max_zoom=18,
         gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
     ).add_to(m)
+
+    # 3. 拡大時（ズーム13以上）に各ヒートマップ粒ごとの外枠を表示するレイヤー
+    fg_points = folium.FeatureGroup(name="各エリア外枠（拡大時）", show=False)
+    max_point_borders = 1500
+    point_df = target_df if len(target_df) <= max_point_borders else target_df.nlargest(max_point_borders, "JINKO")
+
+    for row in point_df.itertuples():
+        lat, lon = float(row.Y_CODE), float(row.X_CODE)
+        jinko, setai = int(row.JINKO), int(row.SETAI)
+        s_name = str(row.S_NAME) if hasattr(row, "S_NAME") else "不明"
+        city_n = str(row.CITY_NAME)
+        popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
+
+        folium.Circle(
+            location=[lat, lon],
+            radius=120,
+            color="#333333",
+            weight=1.2,
+            opacity=0.85,
+            fill=False,
+            tooltip=f"{city_n} {s_name}（人口: {jinko:,}人）",
+            popup=folium.Popup(popup_html, max_width=250)
+        ).add_to(fg_points)
+
+    fg_points.add_to(m)
+    m.get_root().add_child(ZoomPointBorderSwitcher(fg_points, zoom_threshold=13))
 
     folium.LayerControl().add_to(m)
     st_folium(m, width="100%", height=650, returned_objects=[])
