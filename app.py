@@ -41,6 +41,21 @@ PREF_CENTERS = np.array([
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
 
 
+def filter_spatial_outliers(df_sub: pd.DataFrame, max_deg_from_median: float = 2.0) -> pd.DataFrame:
+    # Remove far spatial outliers from area bounds/hull calculations
+    if len(df_sub) < 10:
+        return df_sub
+    med_lat = float(df_sub["Y_CODE"].median())
+    med_lon = float(df_sub["X_CODE"].median())
+    d_lat = (df_sub["Y_CODE"].to_numpy(dtype=np.float64) - med_lat) ** 2
+    d_lon = (df_sub["X_CODE"].to_numpy(dtype=np.float64) - med_lon) ** 2
+    dist = np.sqrt(d_lat + d_lon)
+    keep_mask = dist <= max_deg_from_median
+    if int(keep_mask.sum()) >= 3:
+        return df_sub.loc[keep_mask]
+    return df_sub
+
+
 def compute_convex_hull(points_yx: np.ndarray) -> list:
     # Compute convex hull polygon coordinates from [lat, lon] array without external libs
     if len(points_yx) == 0:
@@ -75,36 +90,36 @@ def compute_convex_hull(points_yx: np.ndarray) -> list:
     for y, x in pts:
         dy = y - center[0]
         dx = x - center[1]
-        expanded.append([float(y + dy * 0.03), float(x + dx * 0.03)])
+        expanded.append([float(y + dy * 0.02), float(x + dx * 0.02)])
     return expanded
 
 
-class ZoomPointBorderSwitcher(MacroElement):
-    def __init__(self, points_layer, zoom_threshold=13):
+class ZoomHeatGridSwitcher(MacroElement):
+    def __init__(self, heat_layer, grid_layer, zoom_threshold=13):
         super().__init__()
-        self._name = "ZoomPointBorderSwitcher"
+        self._name = "ZoomHeatGridSwitcher"
         map_var = "{{ this._parent.get_name() }}"
-        points_var = points_layer.get_name()
+        heat_var = heat_layer.get_name()
+        grid_var = grid_layer.get_name()
         js_body = textwrap.dedent(f'''
         {{% macro script(this, kwargs) %}}
         var map = {map_var};
-        var pointsLayer = {points_var};
+        var heatLayer = {heat_var};
+        var gridLayer = {grid_var};
 
-        function togglePointBorders() {{
+        function toggleByZoom() {{
             var z = map.getZoom();
             if (z >= {zoom_threshold}) {{
-                if (!map.hasLayer(pointsLayer)) {{
-                    map.addLayer(pointsLayer);
-                }}
+                if (map.hasLayer(heatLayer)) {{ map.removeLayer(heatLayer); }}
+                if (!map.hasLayer(gridLayer)) {{ map.addLayer(gridLayer); }}
             }} else {{
-                if (map.hasLayer(pointsLayer)) {{
-                    map.removeLayer(pointsLayer);
-                }}
+                if (map.hasLayer(gridLayer)) {{ map.removeLayer(gridLayer); }}
+                if (!map.hasLayer(heatLayer)) {{ map.addLayer(heatLayer); }}
             }}
         }}
 
-        map.on('zoomend', togglePointBorders);
-        togglePointBorders();
+        map.on('zoomend', toggleByZoom);
+        toggleByZoom();
         {{% endmacro %}}
         ''').strip()
         self._template = Template(js_body)
@@ -206,7 +221,7 @@ else:
 filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
 selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
-st.sidebar.caption("境界線：エリア形状に沿った外枠 / 拡大（ズーム13以上）で各粒の外枠を表示")
+st.sidebar.caption("表示：広域はヒートマップ＋外枠 / 拡大（ズーム13以上）はグリッド（クリックで地図内ポップアップ）")
 
 has_area_filter = (
     selected_pref != "（すべて）"
@@ -257,14 +272,16 @@ if not has_area_filter:
     del m
     gc.collect()
 elif not target_df.empty:
-    coords_yx = target_df[["Y_CODE", "X_CODE"]].to_numpy(dtype=np.float32)
-    center_lat = float(np.mean(coords_yx[:, 0]))
-    center_lon = float(np.mean(coords_yx[:, 1]))
-    zoom_start = 12 if is_city_selected else 8
+    clean_df = filter_spatial_outliers(target_df, max_deg_from_median=2.0)
+    coords_yx = clean_df[["Y_CODE", "X_CODE"]].to_numpy(dtype=np.float32)
+    center_lat = float(np.median(coords_yx[:, 0]))
+    center_lon = float(np.median(coords_yx[:, 1]))
+    zoom_start = 13 if is_city_selected else 8
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
     add_base_tiles(m)
 
+    # 1. 都道府県・市区町村の分布に沿った多角形外枠
     hull_coords = compute_convex_hull(coords_yx)
     if len(hull_coords) >= 3:
         folium.Polygon(
@@ -278,8 +295,10 @@ elif not target_df.empty:
             tooltip=f"{area_label} 外枠"
         ).add_to(m)
 
+    # 2. ヒートマップレイヤー（広域ズーム用）
+    fg_heat = folium.FeatureGroup(name="広域ヒートマップ", show=True)
     max_hm = 10000
-    hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
+    hm_df = clean_df if len(clean_df) <= max_hm else clean_df.sample(max_hm, random_state=42)
     heat_data = list(zip(
         hm_df["Y_CODE"].astype(float).tolist(),
         hm_df["X_CODE"].astype(float).tolist(),
@@ -291,62 +310,44 @@ elif not target_df.empty:
         blur=15,
         max_zoom=18,
         gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
-    ).add_to(m)
+    ).add_to(fg_heat)
+    fg_heat.add_to(m)
 
-    fg_points = folium.FeatureGroup(name="各エリア外枠（拡大時）", show=False)
-    max_point_borders = 1500
-    point_df = target_df if len(target_df) <= max_point_borders else target_df.nlargest(max_point_borders, "JINKO")
+    # 3. グリッドレイヤー（拡大ズーム13以上用・クリックで地図内ポップアップ表示）
+    fg_grid = folium.FeatureGroup(name="詳細グリッド", show=False)
+    max_grid = 2500
+    if len(clean_df) <= max_grid:
+        grid_df = clean_df
+    else:
+        grid_df = clean_df.nlargest(max_grid, "JINKO")
 
-    for row in point_df.itertuples():
+    dlat, dlon = 0.0006, 0.0008
+    for row in grid_df.itertuples():
         lat, lon = float(row.Y_CODE), float(row.X_CODE)
         jinko, setai = int(row.JINKO), int(row.SETAI)
         s_name = str(row.S_NAME) if hasattr(row, "S_NAME") else "不明"
         city_n = str(row.CITY_NAME)
+
+        fill_col = "#e31a1c" if jinko >= 500 else ("#fd8d3c" if jinko >= 200 else ("#fecc5c" if jinko >= 50 else "#ffffb2"))
         popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
 
-        folium.Circle(
-            location=[lat, lon],
-            radius=130,
-            color="#333333",
-            weight=1.3,
-            opacity=0.85,
+        folium.Rectangle(
+            bounds=[[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]],
+            color="#e67e22",
+            weight=0.6,
             fill=True,
-            fill_color="#ffffff",
-            fill_opacity=0.05,
-            tooltip=f"{city_n} {s_name}（人口: {jinko:,}人 / 世帯: {setai:,}世帯）",
+            fill_color=fill_col,
+            fill_opacity=0.65,
+            tooltip=f"{city_n} {s_name}（人口: {jinko:,}人）",
             popup=folium.Popup(popup_html, max_width=250)
-        ).add_to(fg_points)
+        ).add_to(fg_grid)
+    fg_grid.add_to(m)
 
-    fg_points.add_to(m)
-    m.get_root().add_child(ZoomPointBorderSwitcher(fg_points, zoom_threshold=13))
+    m.get_root().add_child(ZoomHeatGridSwitcher(fg_heat, fg_grid, zoom_threshold=13))
 
     folium.LayerControl().add_to(m)
-    map_res = st_folium(m, width="100%", height=620, returned_objects=["last_clicked"])
+    st_folium(m, width="100%", height=650, returned_objects=[])
     del m
     gc.collect()
-
-    st.markdown("#### 🖱️ クリック地点の地域データ")
-    clicked = map_res.get("last_clicked") if isinstance(map_res, dict) else None
-    if clicked and "lat" in clicked and "lng" in clicked:
-        c_lat = float(clicked["lat"])
-        c_lon = float(clicked["lng"])
-        d2 = (target_df["Y_CODE"].to_numpy(dtype=np.float64) - c_lat) ** 2 + (
-            target_df["X_CODE"].to_numpy(dtype=np.float64) - c_lon
-        ) ** 2
-        nearest_pos = int(np.argmin(d2))
-        near_row = target_df.iloc[nearest_pos]
-        near_s = str(near_row["S_NAME"]) if "S_NAME" in target_df.columns else "不明"
-        near_city = str(near_row["CITY_NAME"])
-        near_jinko = int(near_row["JINKO"])
-        near_setai = int(near_row["SETAI"])
-        approx_km = float(np.sqrt(d2[nearest_pos]) * 111.0)
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("最寄り地域", f"{near_city} {near_s}")
-        k2.metric("人口", f"{near_jinko:,} 人")
-        k3.metric("世帯数", f"{near_setai:,} 世帯")
-        k4.metric("クリック地点からの目安距離", f"{approx_km:.2f} km")
-    else:
-        st.caption("地図上をクリックすると、その付近の地域名・人口・世帯数がここに表示されます（拡大時は各粒の枠をクリックしてもポップアップが開きます）。")
 else:
     st.warning("条件に一致するエリアデータがありません。絞り込み条件を変更してください。")
