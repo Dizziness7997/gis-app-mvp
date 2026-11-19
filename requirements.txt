@@ -1,5 +1,7 @@
 streamlit
 pandas
+numpy
 folium
 streamlit-folium
 gdown
+pyarrow
