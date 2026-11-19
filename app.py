@@ -113,10 +113,13 @@ else:
 filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
 selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
-display_mode = st.sidebar.radio(
-    "地図表示スタイル",
-    ["自動（広域：ヒートマップ / 詳細：グリッド）", "ヒートマップ重視", "詳細グリッド重視"],
-    index=0
+st.sidebar.caption("表示スタイル：自動（広域はヒートマップ / 詳細はグリッド）")
+
+has_area_filter = (
+    selected_pref != "（すべて）"
+    or selected_city != "（すべて）"
+    or bool(pref_keyword.strip())
+    or bool(city_keyword.strip())
 )
 
 mask = pd.Series(True, index=df.index)
@@ -150,10 +153,33 @@ col4.metric("対象エリア数", f"{len(target_df):,} 件")
 
 st.markdown("---")
 
-if not target_df.empty:
+if not has_area_filter:
+    st.info("左のサイドバーから「都道府県」または「市区町村」を選択・入力すると、対象エリアのヒートマップ／グリッドが表示されます。")
+    m = folium.Map(location=[36.5, 138.0], zoom_start=5, tiles=None)
+    folium.TileLayer(
+        tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
+        attr="地理院タイル（淡色地図）",
+        name="国土地理院 淡色地図",
+        overlay=False,
+        control=True,
+        max_zoom=18
+    ).add_to(m)
+    folium.TileLayer(
+        tiles="https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+        attr="地理院タイル（標準地図）",
+        name="国土地理院 標準地図",
+        overlay=False,
+        control=True,
+        max_zoom=18
+    ).add_to(m)
+    folium.LayerControl().add_to(m)
+    st_folium(m, width="100%", height=650, returned_objects=[])
+    del m
+    gc.collect()
+elif not target_df.empty:
     center_lat = float(target_df["Y_CODE"].mean())
     center_lon = float(target_df["X_CODE"].mean())
-    zoom_start = 13 if selected_city != "（すべて）" else (8 if selected_pref != "（すべて）" else 6)
+    zoom_start = 13 if selected_city != "（すべて）" else (8 if selected_pref != "（すべて）" else 7)
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
     folium.TileLayer(
@@ -173,12 +199,7 @@ if not target_df.empty:
         max_zoom=18
     ).add_to(m)
 
-    use_heatmap = (
-        display_mode == "ヒートマップ重視"
-        or (display_mode.startswith("自動") and len(target_df) > 1500)
-    )
-
-    if use_heatmap:
+    if len(target_df) > 1500:
         max_hm = 10000
         hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
         heat_data = list(zip(
@@ -195,9 +216,6 @@ if not target_df.empty:
         ).add_to(m)
     else:
         grid_df = target_df if len(target_df) <= 1500 else target_df.head(1500)
-        if len(target_df) > 1500:
-            st.info(f"表示件数が多いため上位1,500件を描画しています（全{len(target_df):,}件）。市区町村で絞り込むと全件表示されます。")
-
         dlat, dlon = 0.0006, 0.0008
         for row in grid_df.itertuples():
             lat, lon = float(row.Y_CODE), float(row.X_CODE)
