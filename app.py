@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
@@ -19,75 +20,77 @@ PREF_LIST = [
     "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
 ]
 
-PREFIX_TO_PREF = {
-    "札幌市": "北海道", "旭川市": "北海道", "函館市": "北海道",
-    "仙台市": "宮城県",
-    "さいたま市": "埼玉県",
-    "千葉市": "千葉県",
-    "千代田区": "東京都", "中央区": "東京都", "港区": "東京都", "新宿区": "東京都",
-    "文京区": "東京都", "台東区": "東京都", "墨田区": "東京都", "江東区": "東京都",
-    "品川区": "東京都", "目黒区": "東京都", "大田区": "東京都", "世田谷区": "東京都",
-    "渋谷区": "東京都", "中野区": "東京都", "杉並区": "東京都", "豊島区": "東京都",
-    "北区": "東京都", "荒川区": "東京都", "板橋区": "東京都", "練馬区": "東京都",
-    "足立区": "東京都", "葛飾区": "東京都", "江戸川区": "東京都", "八王子市": "東京都",
-    "横浜市": "神奈川県", "川崎市": "神奈川県", "相模原市": "神奈川県",
-    "新潟市": "新潟県",
-    "静岡市": "静岡県", "浜松市": "静岡県",
-    "名古屋市": "愛知県",
-    "京都市": "京都府",
-    "大阪市": "大阪府", "堺市": "大阪府",
-    "神戸市": "兵庫県",
-    "岡山市": "岡山県",
-    "広島市": "広島県",
-    "北九州市": "福岡県", "福岡市": "福岡県",
-    "熊本市": "熊本県",
-}
+# 47都道府県庁の代表座標（都道府県コード/列がない場合の最寄り判定用）
+PREF_CENTERS = np.array([
+    [43.064, 141.347], [40.824, 140.740], [39.704, 141.153], [38.269, 140.872],
+    [39.719, 140.102], [38.240, 140.363], [37.750, 140.468], [36.342, 140.447],
+    [36.566, 139.884], [36.391, 139.060], [35.857, 139.649], [35.605, 140.123],
+    [35.689, 139.692], [35.448, 139.643], [37.902, 139.023], [36.695, 137.211],
+    [36.595, 136.626], [36.065, 136.222], [35.664, 138.568], [36.651, 138.181],
+    [35.391, 136.722], [34.977, 138.383], [35.180, 136.907], [34.730, 136.509],
+    [35.004, 135.869], [35.021, 135.756], [34.686, 135.520], [34.691, 135.183],
+    [34.685, 135.833], [34.226, 135.168], [35.504, 134.238], [35.472, 133.051],
+    [34.662, 133.935], [34.397, 132.460], [34.186, 131.471], [34.066, 134.559],
+    [34.340, 134.043], [33.842, 132.766], [33.560, 133.531], [33.606, 130.418],
+    [33.249, 130.299], [32.745, 129.874], [32.790, 130.742], [33.238, 131.613],
+    [31.911, 131.424], [31.560, 130.558], [26.212, 127.681]
+], dtype=np.float32)
 
-def infer_pref(city_name: str) -> str:
-    if not isinstance(city_name, str) or not city_name:
-        return ""
-    if city_name.startswith("北海道"):
-        return "北海道"
-    for p in PREF_LIST:
-        if city_name.startswith(p):
-            return p
-    for prefix, pref in PREFIX_TO_PREF.items():
-        if city_name.startswith(prefix):
-            return pref
-    return ""
-
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def load_data():
     file_id = "1mx8pOhlG4kv3VelpZ-sSqzphLh-5l0uN"
     output = "small_area_centroids.csv"
 
     if not os.path.exists(output):
         url = f"https://drive.google.com/uc?id={file_id}"
-        with st.spinner("Googleドライブから214万件のマスターデータをダウンロード中...（初回のみ数分かかります）"):
-            gdown.download(url, output, quiet=False)
+        gdown.download(url, output, quiet=True)
 
-    df = pd.read_csv(output, low_memory=False)
-    df["JINKO"] = pd.to_numeric(df["JINKO"], errors="coerce").fillna(0)
-    df["SETAI"] = pd.to_numeric(df["SETAI"], errors="coerce").fillna(0)
-    df = df.dropna(subset=["X_CODE", "Y_CODE"])
-    df["CITY_NAME"] = df["CITY_NAME"].astype(str)
+    # メモリ節約のため必要な列のみ確認して読み込み
+    header = pd.read_csv(output, nrows=0).columns.tolist()
+    pref_col = next((c for c in ["PREF_NAME", "KEN_NAME", "都道府県名", "都道府県"] if c in header), None)
+    code_col = next((c for c in ["PREF", "KEN", "JIS_CODE", "KEY_CODE", "CITY_CODE"] if c in header), None)
 
-    pref_candidates = ["PREF_NAME", "KEN_NAME", "都道府県名", "都道府県"]
-    found_pref_col = next((c for c in pref_candidates if c in df.columns), None)
-    if found_pref_col:
-        df["PREF_NAME"] = df[found_pref_col].fillna("").astype(str)
+    use_cols = [c for c in ["CITY_NAME", "S_NAME", "JINKO", "SETAI", "X_CODE", "Y_CODE", pref_col, code_col] if c and c in header]
+    df = pd.read_csv(output, usecols=use_cols, low_memory=False)
+
+    df["JINKO"] = pd.to_numeric(df["JINKO"], errors="coerce").fillna(0).astype(np.int32)
+    df["SETAI"] = pd.to_numeric(df["SETAI"], errors="coerce").fillna(0).astype(np.int32)
+    df["X_CODE"] = pd.to_numeric(df["X_CODE"], errors="coerce").astype(np.float32)
+    df["Y_CODE"] = pd.to_numeric(df["Y_CODE"], errors="coerce").astype(np.float32)
+    df = df.dropna(subset=["X_CODE", "Y_CODE"]).reset_index(drop=True)
+    df["CITY_NAME"] = df["CITY_NAME"].fillna("不明").astype(str)
+
+    # 都道府県の割り当て（列 → JISコード先頭2桁 → 座標最近傍の順で確実に47都道府県を付与）
+    if pref_col and df[pref_col].notna().any():
+        df["PREF_NAME"] = df[pref_col].fillna("").astype(str)
+    elif code_col:
+        codes = df[code_col].astype(str).str.zfill(5).str[:2]
+        code_map = {f"{i+1:02d}": PREF_LIST[i] for i in range(47)}
+        df["PREF_NAME"] = codes.map(code_map).fillna("")
     else:
-        df["PREF_NAME"] = df["CITY_NAME"].apply(infer_pref)
+        df["PREF_NAME"] = ""
 
+    # 未割り当て行があれば市区町村ごとの代表座標から47都道府県を高速判定
+    if (df["PREF_NAME"] == "").any():
+        city_coords = df.groupby("CITY_NAME")[["Y_CODE", "X_CODE"]].mean()
+        coords = city_coords.values[:, None, :]  # (N_city, 1, 2)
+        dists = ((coords - PREF_CENTERS[None, :, :]) ** 2).sum(axis=2)
+        nearest_idx = dists.argmin(axis=1)
+        city_to_pref = dict(zip(city_coords.index, [PREF_LIST[i] for i in nearest_idx]))
+        mask = df["PREF_NAME"] == ""
+        df.loc[mask, "PREF_NAME"] = df.loc[mask, "CITY_NAME"].map(city_to_pref)
+
+    # カテゴリ型にしてメモリ大幅削減
+    df["PREF_NAME"] = df["PREF_NAME"].astype("category")
+    df["CITY_NAME"] = df["CITY_NAME"].astype("category")
     return df
 
-with st.spinner("データを読み込んでいます..."):
+with st.spinner("データを読み込んでいます（初回は1〜2分かかります）..."):
     df = load_data()
 
-if df.empty:
-    st.error("データの読み込みに失敗しました。ファイルIDや共有設定をご確認ください。")
-    st.stop()
-
+# ==========================================
+# サイドバー：都道府県＆市区町村の絞り込み（文字入力対応）
+# ==========================================
 st.sidebar.header("🔍 エリア絞り込み")
 
 pref_keyword = st.sidebar.text_input(
@@ -95,18 +98,11 @@ pref_keyword = st.sidebar.text_input(
     placeholder="例：北海道、東京都、新潟県"
 )
 
-data_prefs = set(p for p in df["PREF_NAME"].unique() if p)
-available_prefs = [p for p in PREF_LIST if p in data_prefs] if data_prefs else PREF_LIST[:]
-if not available_prefs:
-    available_prefs = PREF_LIST[:]
+existing_prefs = set(df["PREF_NAME"].cat.categories)
+available_prefs = [p for p in PREF_LIST if p in existing_prefs]
+filtered_prefs = [p for p in available_prefs if pref_keyword.strip() in p] if pref_keyword.strip() else available_prefs
 
-if pref_keyword.strip():
-    filtered_prefs = [p for p in available_prefs if pref_keyword.strip() in p]
-else:
-    filtered_prefs = available_prefs
-
-pref_options = ["（すべて）"] + filtered_prefs
-selected_pref = st.sidebar.selectbox("都道府県を選択", pref_options, index=0)
+selected_pref = st.sidebar.selectbox("都道府県を選択", ["（すべて）"] + filtered_prefs, index=0)
 
 city_keyword = st.sidebar.text_input(
     "市区町村を文字で絞り込み（都道府県未選択でも可）",
@@ -114,19 +110,12 @@ city_keyword = st.sidebar.text_input(
 )
 
 if selected_pref != "（すべて）":
-    matched_pref_rows = df[df["PREF_NAME"] == selected_pref]
-    base_city_df = matched_pref_rows if not matched_pref_rows.empty else df
+    city_candidates = sorted(df.loc[df["PREF_NAME"] == selected_pref, "CITY_NAME"].unique().tolist())
 else:
-    base_city_df = df
+    city_candidates = sorted(df["CITY_NAME"].cat.categories.tolist())
 
-city_candidates = sorted(base_city_df["CITY_NAME"].dropna().unique().tolist())
-if city_keyword.strip():
-    filtered_cities = [c for c in city_candidates if city_keyword.strip() in c]
-else:
-    filtered_cities = city_candidates
-
-city_options = ["（すべて）"] + filtered_cities
-selected_city = st.sidebar.selectbox("市区町村を選択", city_options, index=0)
+filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
+selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
 
 display_mode = st.sidebar.radio(
     "地図表示スタイル",
@@ -134,23 +123,26 @@ display_mode = st.sidebar.radio(
     index=0
 )
 
-target_df = df.copy()
+# ==========================================
+# メモリをコピーせずブールマスクで高速抽出
+# ==========================================
+mask = pd.Series(True, index=df.index)
 if selected_pref != "（すべて）":
-    pref_rows = target_df[target_df["PREF_NAME"] == selected_pref]
-    if not pref_rows.empty:
-        target_df = pref_rows
+    mask &= (df["PREF_NAME"] == selected_pref)
 elif pref_keyword.strip():
-    kw_rows = target_df[target_df["PREF_NAME"].str.contains(pref_keyword.strip(), na=False)]
-    if not kw_rows.empty:
-        target_df = kw_rows
+    matched_p = [p for p in available_prefs if pref_keyword.strip() in p]
+    mask &= df["PREF_NAME"].isin(matched_p)
 
 if selected_city != "（すべて）":
-    target_df = target_df[target_df["CITY_NAME"] == selected_city]
+    mask &= (df["CITY_NAME"] == selected_city)
 elif city_keyword.strip():
-    target_df = target_df[target_df["CITY_NAME"].str.contains(city_keyword.strip(), na=False)]
+    matched_c = [c for c in city_candidates if city_keyword.strip() in c]
+    mask &= df["CITY_NAME"].isin(matched_c)
 
-total_jinko = target_df["JINKO"].sum()
-total_setai = target_df["SETAI"].sum()
+target_df = df.loc[mask]
+
+total_jinko = int(target_df["JINKO"].sum())
+total_setai = int(target_df["SETAI"].sum())
 area_label = (
     f"{selected_pref} / {selected_city}"
     if selected_pref != "（すべて）" and selected_city != "（すべて）"
@@ -159,8 +151,8 @@ area_label = (
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("対象エリア", area_label)
-col2.metric("総人口", f"{int(total_jinko):,} 人")
-col3.metric("総世帯数", f"{int(total_setai):,} 世帯")
+col2.metric("総人口", f"{total_jinko:,} 人")
+col3.metric("総世帯数", f"{total_setai:,} 世帯")
 col4.metric("対象エリア数", f"{len(target_df):,} 件")
 
 st.markdown("---")
@@ -169,15 +161,9 @@ if not target_df.empty:
     center_lat = float(target_df["Y_CODE"].mean())
     center_lon = float(target_df["X_CODE"].mean())
 
-    if selected_city != "（すべて）":
-        zoom_start = 13
-    elif selected_pref != "（すべて）":
-        zoom_start = 8
-    else:
-        zoom_start = 6
+    zoom_start = 13 if selected_city != "（すべて）" else (8 if selected_pref != "（すべて）" else 6)
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
-
     folium.TileLayer(
         tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
         attr="地理院タイル（淡色地図）",
@@ -186,7 +172,6 @@ if not target_df.empty:
         control=True,
         max_zoom=18
     ).add_to(m)
-
     folium.TileLayer(
         tiles="https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
         attr="地理院タイル（標準地図）",
@@ -202,11 +187,12 @@ if not target_df.empty:
     )
 
     if use_heatmap:
-        hm_df = target_df if len(target_df) <= 50000 else target_df.sample(50000, random_state=42)
-        heat_data = [
-            [float(r["Y_CODE"]), float(r["X_CODE"]), float(max(r["JINKO"], 1))]
-            for _, r in hm_df.iterrows()
-        ]
+        hm_df = target_df if len(target_df) <= 30000 else target_df.sample(30000, random_state=42)
+        heat_data = list(zip(
+            hm_df["Y_CODE"].astype(float).tolist(),
+            hm_df["X_CODE"].astype(float).tolist(),
+            np.maximum(hm_df["JINKO"].astype(float).values, 1.0).tolist()
+        ))
         HeatMap(
             heat_data,
             radius=18 if len(hm_df) > 5000 else 22,
@@ -215,31 +201,19 @@ if not target_df.empty:
             gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
         ).add_to(m)
     else:
-        grid_df = target_df if len(target_df) <= 3000 else target_df.head(3000)
-        if len(target_df) > 3000:
-            st.info(f"表示件数が多いため上位3,000件を描画しています（全{len(target_df):,}件）。市区町村で絞り込むと全件表示されます。")
+        grid_df = target_df if len(target_df) <= 2500 else target_df.head(2500)
+        if len(target_df) > 2500:
+            st.info(f"表示件数が多いため上位2,500件を描画しています（全{len(target_df):,}件）。市区町村で絞り込むと全件表示されます。")
 
-        dlat = 0.0006
-        dlon = 0.0008
+        dlat, dlon = 0.0006, 0.0008
+        for row in grid_df.itertuples():
+            lat, lon = float(row.Y_CODE), float(row.X_CODE)
+            jinko, setai = int(row.JINKO), int(row.SETAI)
+            s_name = row.S_NAME if hasattr(row, "S_NAME") and pd.notna(row.S_NAME) else "不明"
+            city_n = str(row.CITY_NAME)
 
-        for _, row in grid_df.iterrows():
-            lat = float(row["Y_CODE"])
-            lon = float(row["X_CODE"])
-            jinko = float(row["JINKO"])
-            setai = float(row["SETAI"])
-            s_name = row["S_NAME"] if "S_NAME" in row and pd.notna(row["S_NAME"]) else "不明"
-            city_n = row["CITY_NAME"]
-
-            if jinko >= 500:
-                fill_col = "#e31a1c"
-            elif jinko >= 200:
-                fill_col = "#fd8d3c"
-            elif jinko >= 50:
-                fill_col = "#fecc5c"
-            else:
-                fill_col = "#ffffb2"
-
-            popup_html = f"<b>{city_n} {s_name}</b><br>人口: {int(jinko):,}人<br>世帯: {int(setai):,}世帯"
+            fill_col = "#e31a1c" if jinko >= 500 else ("#fd8d3c" if jinko >= 200 else ("#fecc5c" if jinko >= 50 else "#ffffb2"))
+            popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
 
             folium.Rectangle(
                 bounds=[[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]],
