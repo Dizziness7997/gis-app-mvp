@@ -1,3 +1,5 @@
+import os
+import gc
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -5,8 +7,6 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 from branca.element import MacroElement, Template
-import os
-import gc
 import gdown
 
 st.set_page_config(page_title="GIS・商圏分析システム MVP", layout="wide")
@@ -38,6 +38,54 @@ PREF_CENTERS = np.array([
 ], dtype=np.float32)
 
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
+
+
+class ZoomLayerSwitcher(MacroElement):
+    def __init__(self, heat_layer, grid_layer, zoom_threshold=12):
+        super().__init__()
+        self._name = "ZoomLayerSwitcher"
+        map_expr = "{{ this._parent.get_name() }}"
+        heat_name = heat_layer.get_name()
+        grid_name = grid_layer.get_name()
+        self._template = Template(
+            "{% macro script(this, kwargs) %}
+"
+            f"var map = {map_expr};
+"
+            f"var heatLayer = {heat_name};
+"
+            f"var gridLayer = {grid_name};
+
+"
+            "function toggleByZoom() {
+"
+            "    var z = map.getZoom();
+"
+            f"    if (z >= {zoom_threshold}) {{
+"
+            "        if (map.hasLayer(heatLayer)) { map.removeLayer(heatLayer); }
+"
+            "        if (!map.hasLayer(gridLayer)) { map.addLayer(gridLayer); }
+"
+            "    } else {
+"
+            "        if (map.hasLayer(gridLayer)) { map.removeLayer(gridLayer); }
+"
+            "        if (!map.hasLayer(heatLayer)) { map.addLayer(heatLayer); }
+"
+            "    }
+"
+            "}
+
+"
+            "map.on('zoomend', toggleByZoom);
+"
+            "toggleByZoom();
+"
+            "{% endmacro %}
+"
+        )
+
 
 @st.cache_data(show_spinner=False)
 def load_data():
@@ -247,30 +295,7 @@ elif not target_df.empty:
         ).add_to(fg_grid)
     fg_grid.add_to(m)
 
-    zoom_switch_js = '''
-    {% macro script(this, kwargs) %}
-    var map = {{ this._parent.get_name() }};
-    var heatLayer = {{ fg_heat.get_name() }};
-    var gridLayer = {{ fg_grid.get_name() }};
-
-    function toggleByZoom() {
-        var z = map.getZoom();
-        if (z >= 12) {
-            if (map.hasLayer(heatLayer)) map.removeLayer(heatLayer);
-            if (!map.hasLayer(gridLayer)) map.addLayer(gridLayer);
-        } else {
-            if (map.hasLayer(gridLayer)) map.removeLayer(gridLayer);
-            if (!map.hasLayer(heatLayer)) map.addLayer(heatLayer);
-        }
-    }
-
-    map.on('zoomend', toggleByZoom);
-    toggleByZoom();
-    {% endmacro %}
-    '''
-    macro = MacroElement()
-    macro._template = Template(zoom_switch_js)
-    m.get_root().add_child(macro)
+    m.get_root().add_child(ZoomLayerSwitcher(fg_heat, fg_grid, zoom_threshold=12))
 
     folium.LayerControl().add_to(m)
     st_folium(m, width="100%", height=650, returned_objects=[])
