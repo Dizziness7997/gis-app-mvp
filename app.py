@@ -1,5 +1,6 @@
 import os
 import gc
+import textwrap
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -44,47 +45,31 @@ class ZoomLayerSwitcher(MacroElement):
     def __init__(self, heat_layer, grid_layer, zoom_threshold=12):
         super().__init__()
         self._name = "ZoomLayerSwitcher"
-        map_expr = "{{ this._parent.get_name() }}"
-        heat_name = heat_layer.get_name()
-        grid_name = grid_layer.get_name()
-        self._template = Template(
-            "{% macro script(this, kwargs) %}
-"
-            f"var map = {map_expr};
-"
-            f"var heatLayer = {heat_name};
-"
-            f"var gridLayer = {grid_name};
+        map_var = "{{ this._parent.get_name() }}"
+        heat_var = heat_layer.get_name()
+        grid_var = grid_layer.get_name()
+        js_body = textwrap.dedent(f'''
+        {{% macro script(this, kwargs) %}}
+        var map = {map_var};
+        var heatLayer = {heat_var};
+        var gridLayer = {grid_var};
 
-"
-            "function toggleByZoom() {
-"
-            "    var z = map.getZoom();
-"
-            f"    if (z >= {zoom_threshold}) {{
-"
-            "        if (map.hasLayer(heatLayer)) { map.removeLayer(heatLayer); }
-"
-            "        if (!map.hasLayer(gridLayer)) { map.addLayer(gridLayer); }
-"
-            "    } else {
-"
-            "        if (map.hasLayer(gridLayer)) { map.removeLayer(gridLayer); }
-"
-            "        if (!map.hasLayer(heatLayer)) { map.addLayer(heatLayer); }
-"
-            "    }
-"
-            "}
+        function toggleByZoom() {{
+            var z = map.getZoom();
+            if (z >= {zoom_threshold}) {{
+                if (map.hasLayer(heatLayer)) {{ map.removeLayer(heatLayer); }}
+                if (!map.hasLayer(gridLayer)) {{ map.addLayer(gridLayer); }}
+            }} else {{
+                if (map.hasLayer(gridLayer)) {{ map.removeLayer(gridLayer); }}
+                if (!map.hasLayer(heatLayer)) {{ map.addLayer(heatLayer); }}
+            }}
+        }}
 
-"
-            "map.on('zoomend', toggleByZoom);
-"
-            "toggleByZoom();
-"
-            "{% endmacro %}
-"
-        )
+        map.on('zoomend', toggleByZoom);
+        toggleByZoom();
+        {{% endmacro %}}
+        ''').strip()
+        self._template = Template(js_body)
 
 
 @st.cache_data(show_spinner=False)
