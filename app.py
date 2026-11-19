@@ -42,6 +42,9 @@ PREF_CENTERS = np.array([
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
 GEOJSON_FILE_ID = "13LAo42gRdBajjeaT95Xx0x8krjlfINFj"
 
+MAX_HEATMAP_POINTS = 15000
+MAX_GRID_POINTS = 1500
+
 
 class ZoomHeatGridSwitcher(folium.MacroElement):
     def __init__(self, heat_layer, grid_layer, zoom_threshold=13):
@@ -51,7 +54,7 @@ class ZoomHeatGridSwitcher(folium.MacroElement):
         heat_var = heat_layer.get_name()
         grid_var = grid_layer.get_name()
         js_body = textwrap.dedent(f"""
-            {{% macro script(this, kwargs) %}}
+            {% macro script(this, kwargs) %}
             var map = {map_var};
             var heatLayer = {heat_var};
             var gridLayer = {grid_var};
@@ -69,7 +72,7 @@ class ZoomHeatGridSwitcher(folium.MacroElement):
 
             map.on('zoomend', toggleByZoom);
             toggleByZoom();
-            {{% endmacro %}}
+            {% endmacro %}
             """).strip()
         self._template = folium.Template(js_body)
 
@@ -83,11 +86,16 @@ def load_data(parquet_file_id: str):
         gdown.download(url, output, quiet=True)
 
     if not os.path.exists(output):
-        return pd.DataFrame(
-            columns=["PREF_NAME", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"]
-        )
+        return pd.DataFrame(columns=["PREF_NAME", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"])
 
+    cols_wanted = [
+        "PREF_NAME", "PREF_CODE", "CITY_CODE", "KEY_CODE",
+        "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"
+    ]
     df = pd.read_parquet(output)
+    keep_cols = [c for c in cols_wanted if c in df.columns]
+    df = df[keep_cols]
+
     df["JINKO"] = pd.to_numeric(df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int32)
     df["SETAI"] = pd.to_numeric(df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int32)
     df["X_CODE"] = pd.to_numeric(df["X_CODE"], errors="coerce").astype(np.float32)
@@ -95,7 +103,7 @@ def load_data(parquet_file_id: str):
     df = df.dropna(subset=["X_CODE", "Y_CODE"]).reset_index(drop=True)
     df["CITY_NAME"] = df.get("CITY_NAME", "").fillna("").astype(str)
 
-    code_candidates = ["PREF_CODE", "CITY_CODE", "KEY_CODE", "JIS_CODE", "PREF"]
+    code_candidates = ["PREF_CODE", "CITY_CODE", "KEY_CODE"]
     found_code_col = next((c for c in code_candidates if c in df.columns), None)
 
     pref_from_code = pd.Series("", index=df.index, dtype=str)
@@ -111,10 +119,8 @@ def load_data(parquet_file_id: str):
         code_map = {f"{i+1:02d}": PREF_LIST[i] for i in range(47)}
         pref_from_code = codes2.map(code_map).fillna("")
 
-    pref_candidates = ["PREF_NAME", "KEN_NAME", "都道府県名", "都道府県"]
-    found_pref_col = next((c for c in pref_candidates if c in df.columns), None)
-    if found_pref_col:
-        raw_pref = df[found_pref_col].fillna("").astype(str).str.strip()
+    if "PREF_NAME" in df.columns:
+        raw_pref = df["PREF_NAME"].fillna("").astype(str).str.strip()
         pref_series = pd.Series(
             np.where(pref_from_code != "", pref_from_code, raw_pref),
             index=df.index,
@@ -140,6 +146,10 @@ def load_data(parquet_file_id: str):
         df["S_NAME"] = df["S_NAME"].fillna("不明").astype("category")
     else:
         df["S_NAME"] = pd.Series("不明", index=df.index, dtype="category")
+
+    for drop_c in ["PREF_CODE", "CITY_CODE", "KEY_CODE"]:
+        if drop_c in df.columns:
+            df.drop(columns=[drop_c], inplace=True)
 
     del pref_series, pref_from_code
     gc.collect()
@@ -237,9 +247,7 @@ if st.sidebar.button("キャッシュ再取得（データ更新時）"):
 
 pref_keyword = st.sidebar.text_input("都道府県を文字で絞り込み", placeholder="例：新潟県、北海道")
 
-available_prefs = [
-    p for p in PREF_LIST if p in set(df["PREF_NAME"].dropna().astype(str).unique())
-]
+available_prefs = [p for p in PREF_LIST if p in set(df["PREF_NAME"].dropna().astype(str).unique())]
 if not available_prefs:
     available_prefs = sorted([p for p in df["PREF_NAME"].dropna().astype(str).unique() if p != ""])
 
@@ -343,10 +351,16 @@ if is_filtered and matched_boundaries["features"]:
     ).add_to(m)
 
 if is_filtered and len(filtered_df) > 0:
+    if len(filtered_df) > MAX_HEATMAP_POINTS:
+        st.caption(f"※描画サイズ抑制のため、ヒートマップは {len(filtered_df):,} 件から {MAX_HEATMAP_POINTS:,} 件を抽出して表示しています。")
+        heat_df = filtered_df.sample(n=MAX_HEATMAP_POINTS, random_state=42)
+    else:
+        heat_df = filtered_df
+
     heat_group = folium.FeatureGroup(name="人口ヒートマップ", show=True)
     heat_points = [
         [float(row.Y_CODE), float(row.X_CODE), max(float(row.JINKO), 1.0)]
-        for row in filtered_df.itertuples(index=False)
+        for row in heat_df.itertuples(index=False)
     ]
     if heat_points:
         HeatMap(heat_points, radius=16, blur=18, max_zoom=13).add_to(heat_group)
@@ -355,7 +369,7 @@ if is_filtered and len(filtered_df) > 0:
     grid_group = folium.FeatureGroup(name="詳細グリッド（ズーム13以上）", show=False)
     half_lat = 0.0006
     half_lon = 0.00075
-    for row in filtered_df.iloc[:2000].itertuples(index=False):
+    for row in filtered_df.iloc[:MAX_GRID_POINTS].itertuples(index=False):
         lat = float(row.Y_CODE)
         lon = float(row.X_CODE)
         s_name = getattr(row, "S_NAME", "不明")
@@ -378,6 +392,9 @@ if is_filtered and len(filtered_df) > 0:
     grid_group.add_to(m)
 
     ZoomHeatGridSwitcher(heat_group, grid_group, zoom_threshold=13).add_to(m)
+
+    del heat_df, heat_points
+    gc.collect()
 
 folium.LayerControl(collapsed=True).add_to(m)
 st_folium(m, width="100%", height=620, returned_objects=[])
