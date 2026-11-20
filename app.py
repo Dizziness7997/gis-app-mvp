@@ -1,7 +1,5 @@
 import gc
-import json
 import os
-import re
 import textwrap
 
 import folium
@@ -15,33 +13,126 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="GIS・商圏分析システム MVP", layout="wide")
 st.title("🗺️ GIS・商圏分析システム (MVP)")
 
-PREF_LIST = [
-    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
-    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
-    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
-    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
-    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
-    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
-    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
+REGIONS = [
+    ("北海道", ["北海道"]),
+    ("東北", ["青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県"]),
+    ("関東", ["茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県"]),
+    ("甲信越・北陸", ["新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県"]),
+    ("東海", ["岐阜県", "静岡県", "愛知県", "三重県"]),
+    ("近畿", ["滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県"]),
+    ("中国", ["鳥取県", "島根県", "岡山県", "広島県", "山口県"]),
+    ("四国", ["徳島県", "香川県", "愛媛県", "高知県"]),
+    ("九州・沖縄", ["福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"]),
 ]
 
-PREF_CENTERS = np.array([
-    [43.064, 141.347], [40.824, 140.740], [39.704, 141.153], [38.269, 140.872],
-    [39.719, 140.102], [38.240, 140.363], [37.750, 140.468], [36.342, 140.447],
-    [36.566, 139.884], [36.391, 139.060], [35.857, 139.649], [35.605, 140.123],
-    [35.689, 139.692], [35.448, 139.643], [37.902, 139.023], [36.695, 137.211],
-    [36.595, 136.626], [36.065, 136.222], [35.664, 138.568], [36.651, 138.181],
-    [35.391, 136.722], [34.977, 138.383], [35.180, 136.907], [34.730, 136.509],
-    [35.004, 135.869], [35.021, 135.756], [34.686, 135.520], [34.691, 135.183],
-    [34.685, 135.833], [34.226, 135.168], [35.504, 134.238], [35.472, 133.051],
-    [34.662, 133.935], [34.397, 132.460], [34.186, 131.471], [34.066, 134.559],
-    [34.340, 134.043], [33.842, 132.766], [33.560, 133.531], [33.606, 130.418],
-    [33.249, 130.299], [32.745, 129.874], [32.790, 130.742], [33.238, 131.613],
-    [31.911, 131.424], [31.560, 130.558], [26.212, 127.681]
-], dtype=np.float32)
+PREF_LIST = [pref for _, prefs in REGIONS for pref in prefs]
+
+PREF_CENTERS = {
+    "北海道": (43.064, 141.347),
+    "青森県": (40.824, 140.740),
+    "岩手県": (39.704, 141.153),
+    "宮城県": (38.269, 140.872),
+    "秋田県": (39.719, 140.102),
+    "山形県": (38.240, 140.363),
+    "福島県": (37.750, 140.468),
+    "茨城県": (36.342, 140.447),
+    "栃木県": (36.566, 139.884),
+    "群馬県": (36.391, 139.060),
+    "埼玉県": (35.857, 139.649),
+    "千葉県": (35.605, 140.123),
+    "東京都": (35.689, 139.692),
+    "神奈川県": (35.448, 139.643),
+    "新潟県": (37.902, 139.023),
+    "富山県": (36.695, 137.211),
+    "石川県": (36.595, 136.626),
+    "福井県": (36.065, 136.222),
+    "山梨県": (35.664, 138.568),
+    "長野県": (36.651, 138.181),
+    "岐阜県": (35.391, 136.722),
+    "静岡県": (34.977, 138.383),
+    "愛知県": (35.180, 136.907),
+    "三重県": (34.730, 136.509),
+    "滋賀県": (35.004, 135.869),
+    "京都府": (35.021, 135.756),
+    "大阪府": (34.686, 135.520),
+    "兵庫県": (34.691, 135.183),
+    "奈良県": (34.685, 135.833),
+    "和歌山県": (34.226, 135.168),
+    "鳥取県": (35.504, 134.238),
+    "島根県": (35.472, 133.051),
+    "岡山県": (34.662, 133.935),
+    "広島県": (34.397, 132.460),
+    "山口県": (34.186, 131.471),
+    "徳島県": (34.066, 134.559),
+    "香川県": (34.340, 134.043),
+    "愛媛県": (33.842, 132.766),
+    "高知県": (33.560, 133.531),
+    "福岡県": (33.606, 130.418),
+    "佐賀県": (33.249, 130.299),
+    "長崎県": (32.745, 129.874),
+    "熊本県": (32.790, 130.742),
+    "大分県": (33.238, 131.613),
+    "宮崎県": (31.911, 131.424),
+    "鹿児島県": (31.560, 130.558),
+    "沖縄県": (26.212, 127.681),
+}
+
+PREF_CENTERS_ARR = np.array(
+    [[PREF_CENTERS[p][0], PREF_CENTERS[p][1]] for p in PREF_LIST],
+    dtype=np.float32,
+)
+
+SHORT_PREF_LABELS = {
+    "北海道": "北海道",
+    "青森県": "青森",
+    "岩手県": "岩手",
+    "宮城県": "宮城",
+    "秋田県": "秋田",
+    "山形県": "山形",
+    "福島県": "福島",
+    "茨城県": "茨城",
+    "栃木県": "栃木",
+    "群馬県": "群馬",
+    "埼玉県": "埼玉",
+    "千葉県": "千葉",
+    "東京都": "東京",
+    "神奈川県": "神奈川",
+    "新潟県": "新潟",
+    "富山県": "富山",
+    "石川県": "石川",
+    "福井県": "福井",
+    "山梨県": "山梨",
+    "長野県": "長野",
+    "岐阜県": "岐阜",
+    "静岡県": "静岡",
+    "愛知県": "愛知",
+    "三重県": "三重",
+    "滋賀県": "滋賀",
+    "京都府": "京都",
+    "大阪府": "大阪",
+    "兵庫県": "兵庫",
+    "奈良県": "奈良",
+    "和歌山県": "和歌山",
+    "鳥取県": "鳥取",
+    "島根県": "島根",
+    "岡山県": "岡山",
+    "広島県": "広島",
+    "山口県": "山口",
+    "徳島県": "徳島",
+    "香川県": "香川",
+    "愛媛県": "愛媛",
+    "高知県": "高知",
+    "福岡県": "福岡",
+    "佐賀県": "佐賀",
+    "長崎県": "長崎",
+    "熊本県": "熊本",
+    "大分県": "大分",
+    "宮崎県": "宮崎",
+    "鹿児島県": "鹿児島",
+    "沖縄県": "沖縄",
+}
 
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
-GEOJSON_FILE_ID = "13LAo42gRdBajjeaT95Xx0x8krjlfINFj"
 
 MAX_HEATMAP_POINTS = 15000
 MAX_GRID_POINTS = 1500
@@ -142,7 +233,7 @@ def load_data(parquet_file_id: str):
         if len(valid_city) > 0:
             city_coords = valid_city.groupby("CITY_NAME", observed=True)[["Y_CODE", "X_CODE"]].mean()
             coords = city_coords.values[:, None, :]
-            dists = ((coords - PREF_CENTERS[None, :, :]) ** 2).sum(axis=2)
+            dists = ((coords - PREF_CENTERS_ARR[None, :, :]) ** 2).sum(axis=2)
             nearest_idx = dists.argmin(axis=1)
             city_to_pref = dict(zip(city_coords.index, [PREF_LIST[i] for i in nearest_idx]))
             mask_empty = (pref_series == "") & (df["CITY_NAME"] != "")
@@ -164,47 +255,6 @@ def load_data(parquet_file_id: str):
     return df
 
 
-@st.cache_data(show_spinner=False)
-def load_boundaries(geojson_file_id: str):
-    output = "admin_boundaries_slim.geojson"
-    if not os.path.exists(output):
-        url = f"https://drive.google.com/uc?id={geojson_file_id}"
-        gdown.download(url, output, quiet=True)
-
-    if not os.path.exists(output):
-        return {"type": "FeatureCollection", "features": []}
-
-    with open(output, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if not (isinstance(data, dict) and isinstance(data.get("features"), list)):
-        return {"type": "FeatureCollection", "features": []}
-
-    normalized_features = []
-    for feat in data["features"]:
-        props = dict(feat.get("properties") or {})
-        p_val = str(props.get("PREF_NAME") or props.get("N03_001") or "").strip()
-        if p_val:
-            props["PREF_NAME"] = p_val
-            feat_copy = dict(feat)
-            feat_copy["properties"] = props
-            normalized_features.append(feat_copy)
-
-    return {"type": "FeatureCollection", "features": normalized_features}
-
-
-def extract_pref_from_tooltip(tooltip_text: str | None) -> str | None:
-    if not tooltip_text or not isinstance(tooltip_text, str):
-        return None
-    cleaned = re.sub(r"^都道府県\s*[:：]\s*", "", tooltip_text.strip()).strip()
-    if cleaned in PREF_LIST:
-        return cleaned
-    for pref in PREF_LIST:
-        if pref in cleaned:
-            return pref
-    return None
-
-
 def add_base_tiles(m):
     folium.TileLayer(
         tiles="https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
@@ -224,46 +274,112 @@ def add_base_tiles(m):
     ).add_to(m)
 
 
-with st.spinner("軽量データと行政界データを読み込んでいます..."):
+def set_selected_pref(pref_name: str):
+    st.session_state["selected_pref"] = pref_name
+    st.session_state["pref_selectbox"] = pref_name
+
+
+def normalize_pref_query(q: str) -> str | None:
+    q_clean = q.strip()
+    if not q_clean:
+        return None
+    if q_clean in PREF_LIST:
+        return q_clean
+    for pref in PREF_LIST:
+        short_name = SHORT_PREF_LABELS.get(pref, pref)
+        if q_clean == short_name or pref.startswith(q_clean) or short_name.startswith(q_clean):
+            return pref
+    return None
+
+
+with st.spinner("小地域マスターデータを読み込んでいます..."):
     df = load_data(PARQUET_FILE_ID)
-    boundaries_data = load_boundaries(GEOJSON_FILE_ID)
 
 if "selected_pref" not in st.session_state:
     st.session_state["selected_pref"] = "（すべて）"
-if "prev_clicked_tooltip" not in st.session_state:
-    st.session_state["prev_clicked_tooltip"] = None
 
-st.sidebar.header("🔍 エリア選択")
-
-if st.sidebar.button("キャッシュ再取得（データ更新時）"):
-    for fname in ["small_area_slim.parquet", "admin_boundaries_slim.geojson"]:
-        if os.path.exists(fname):
-            os.remove(fname)
-    st.cache_data.clear()
-    st.session_state["selected_pref"] = "（すべて）"
-    st.session_state["prev_clicked_tooltip"] = None
-    st.rerun()
-
-available_prefs = [p for p in PREF_LIST if p in set(df["PREF_NAME"].dropna().astype(str).unique())]
+available_prefs_set = set(df["PREF_NAME"].dropna().astype(str).unique())
+available_prefs = [p for p in PREF_LIST if p in available_prefs_set]
 if not available_prefs:
-    available_prefs = sorted([p for p in df["PREF_NAME"].dropna().astype(str).unique() if p != ""])
+    available_prefs = sorted([p for p in available_prefs_set if p != ""])
 
 pref_options = ["（すべて）"] + available_prefs
 
 if st.session_state["selected_pref"] not in pref_options:
     st.session_state["selected_pref"] = "（すべて）"
+if "pref_selectbox" not in st.session_state or st.session_state["pref_selectbox"] not in pref_options:
+    st.session_state["pref_selectbox"] = st.session_state["selected_pref"]
 
-selected_pref = st.sidebar.selectbox(
-    "都道府県を選択（地図クリックでも選択可能）",
-    pref_options,
-    key="selected_pref",
+# サイドバー：検索・プルダウン選択・リセット
+st.sidebar.header("🔍 エリア検索・選択")
+
+search_query = st.sidebar.text_input(
+    "都道府県を検索（例: 新潟、東京、大阪）",
+    placeholder="都道府県名を入力",
+    key="pref_search_input",
 )
 
+if search_query:
+    matched_prefs = [
+        p for p in available_prefs
+        if search_query.strip() in p or search_query.strip() in SHORT_PREF_LABELS.get(p, "")
+    ]
+    if matched_prefs:
+        st.sidebar.caption(f"候補: {', '.join(matched_prefs[:6])}")
+        if st.sidebar.button(f"「{matched_prefs[0]}」を選択", key="apply_search_pref"):
+            set_selected_pref(matched_prefs[0])
+            st.rerun()
+    else:
+        st.sidebar.caption("該当する都道府県が見つかりません。")
+
+st.sidebar.selectbox(
+    "プルダウンから都道府県を選択",
+    pref_options,
+    key="pref_selectbox",
+    on_change=lambda: st.session_state.update({"selected_pref": st.session_state["pref_selectbox"]}),
+)
+
+col_sb1, col_sb2 = st.sidebar.columns(2)
+with col_sb1:
+    if st.button("選択解除", use_container_width=True):
+        set_selected_pref("（すべて）")
+        st.rerun()
+with col_sb2:
+    if st.button("キャッシュ再取得", use_container_width=True):
+        if os.path.exists("small_area_slim.parquet"):
+            os.remove("small_area_slim.parquet")
+        st.cache_data.clear()
+        set_selected_pref("（すべて）")
+        st.rerun()
+
+selected_pref = st.session_state["selected_pref"]
 is_pref_selected = selected_pref != "（すべて）"
+
+# メイン画面：地方別都道府県ボタン選択UI（初期画面の軽量化＆直感的選択）
+with st.expander("🗾 地方・都道府県ボタンから選ぶ", expanded=not is_pref_selected):
+    st.caption("地方ブロックごとのボタンから都道府県を選ぶと、対象エリアのヒートマップ・グリッド地図を表示します（初期表示は軽量化のためヒートマップ未描画）。")
+    for region_name, region_prefs in REGIONS:
+        present_prefs = [p for p in region_prefs if p in available_prefs]
+        if not present_prefs:
+            continue
+        st.markdown(f"**{region_name}**")
+        btn_cols = st.columns(min(len(present_prefs), 8))
+        for idx, pref in enumerate(present_prefs):
+            col = btn_cols[idx % len(btn_cols)]
+            is_current = (pref == selected_pref)
+            btn_label = f"✅ {SHORT_PREF_LABELS.get(pref, pref)}" if is_current else SHORT_PREF_LABELS.get(pref, pref)
+            if col.button(
+                btn_label,
+                key=f"btn_pref_{pref}",
+                type="primary" if is_current else "secondary",
+                use_container_width=True,
+            ):
+                set_selected_pref(pref)
+                st.rerun()
 
 if not is_pref_selected:
     filtered_df = df.iloc[0:0]
-    area_label = "未選択（地図クリックまたは選択肢から都道府県を選択）"
+    area_label = "未選択（地方ボタン・検索・プルダウンから選択）"
     total_pop = 0
     total_households = 0
     area_count = 0
@@ -280,46 +396,17 @@ m2.metric("総人口", f"{total_pop:,} 人")
 m3.metric("総世帯数", f"{total_households:,} 世帯")
 m4.metric("対象エリア数", f"{area_count:,} 件")
 
+# 都道府県選択時のみヒートマップ＋（ズーム13以上で）グリッド地図を表示
 if is_pref_selected and len(filtered_df) > 0:
-    pref_idx = PREF_LIST.index(selected_pref) if selected_pref in PREF_LIST else None
-    if pref_idx is not None:
-        center_lat = float(PREF_CENTERS[pref_idx, 0])
-        center_lon = float(PREF_CENTERS[pref_idx, 1])
+    if selected_pref in PREF_CENTERS:
+        center_lat, center_lon = PREF_CENTERS[selected_pref]
     else:
         center_lat = float(filtered_df["Y_CODE"].mean())
         center_lon = float(filtered_df["X_CODE"].mean())
-    zoom_start = 9
-else:
-    center_lat, center_lon = 36.5, 138.0
-    zoom_start = 5
 
-m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None, control_scale=True)
-add_base_tiles(m)
+    m = folium.Map(location=[float(center_lat), float(center_lon)], zoom_start=9, tiles=None, control_scale=True)
+    add_base_tiles(m)
 
-if not is_pref_selected and boundaries_data["features"]:
-    folium.GeoJson(
-        boundaries_data,
-        name="都道府県境界線（クリックで選択）",
-        style_function=lambda _: {
-            "color": "#1f4e78",
-            "weight": 1.5,
-            "fillColor": "#4a90e2",
-            "fillOpacity": 0.12,
-        },
-        highlight_function=lambda _: {
-            "color": "#d95f02",
-            "weight": 2.5,
-            "fillColor": "#fdae61",
-            "fillOpacity": 0.35,
-        },
-        tooltip=folium.GeoJsonTooltip(
-            fields=["PREF_NAME"],
-            aliases=["都道府県"],
-            localize=True,
-        ),
-    ).add_to(m)
-
-if is_pref_selected and len(filtered_df) > 0:
     if len(filtered_df) > MAX_HEATMAP_POINTS:
         st.caption(f"※描画サイズ抑制のため、ヒートマップは {len(filtered_df):,} 件から {MAX_HEATMAP_POINTS:,} 件を抽出して表示しています。")
         heat_df = filtered_df.sample(n=MAX_HEATMAP_POINTS, random_state=42)
@@ -365,19 +452,13 @@ if is_pref_selected and len(filtered_df) > 0:
     del heat_df, heat_points
     gc.collect()
 
-folium.LayerControl(collapsed=True).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)
 
-map_state = st_folium(
-    m,
-    width="100%",
-    height=620,
-    returned_objects=["last_object_clicked_tooltip"],
-)
-
-clicked_tooltip = (map_state or {}).get("last_object_clicked_tooltip")
-if clicked_tooltip and clicked_tooltip != st.session_state["prev_clicked_tooltip"]:
-    st.session_state["prev_clicked_tooltip"] = clicked_tooltip
-    clicked_pref = extract_pref_from_tooltip(clicked_tooltip)
-    if clicked_pref and clicked_pref != st.session_state["selected_pref"]:
-        st.session_state["selected_pref"] = clicked_pref
-        st.rerun()
+    st_folium(
+        m,
+        width="100%",
+        height=620,
+        returned_objects=[],
+    )
+else:
+    st.info("地方ブロックの都道府県ボタン、サイドバーの検索、またはプルダウンから都道府県を選択すると、地図（ヒートマップ・ズーム切替グリッド）が表示されます。")
