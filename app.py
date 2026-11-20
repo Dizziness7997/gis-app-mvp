@@ -193,7 +193,7 @@ def load_data(parquet_file_id: str):
     ]
     df = pd.read_parquet(output)
     keep_cols = [c for c in cols_wanted if c in df.columns]
-    df = df[keep_cols]
+    df = df[keep_cols].copy()
 
     df["JINKO"] = pd.to_numeric(df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int32)
     df["SETAI"] = pd.to_numeric(df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int32)
@@ -237,6 +237,7 @@ def load_data(parquet_file_id: str):
             nearest_idx = dists.argmin(axis=1)
             city_to_pref = dict(zip(city_coords.index, [PREF_LIST[i] for i in nearest_idx]))
             mask_empty = (pref_series == "") & (df["CITY_NAME"] != "")
+            pref_series = pref_series.copy()
             pref_series.loc[mask_empty] = df.loc[mask_empty, "CITY_NAME"].map(city_to_pref).fillna("")
 
     df["PREF_NAME"] = pref_series.astype("category")
@@ -246,9 +247,9 @@ def load_data(parquet_file_id: str):
     else:
         df["S_NAME"] = pd.Series("不明", index=df.index, dtype="category")
 
-    for drop_c in ["PREF_CODE", "CITY_CODE", "KEY_CODE"]:
-        if drop_c in df.columns:
-            df.drop(columns=[drop_c], inplace=True)
+    drop_cols = [c for c in ["PREF_CODE", "CITY_CODE", "KEY_CODE"] if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
 
     del pref_series, pref_from_code
     gc.collect()
@@ -279,19 +280,6 @@ def set_selected_pref(pref_name: str):
     st.session_state["pref_selectbox"] = pref_name
 
 
-def normalize_pref_query(q: str) -> str | None:
-    q_clean = q.strip()
-    if not q_clean:
-        return None
-    if q_clean in PREF_LIST:
-        return q_clean
-    for pref in PREF_LIST:
-        short_name = SHORT_PREF_LABELS.get(pref, pref)
-        if q_clean == short_name or pref.startswith(q_clean) or short_name.startswith(q_clean):
-            return pref
-    return None
-
-
 with st.spinner("小地域マスターデータを読み込んでいます..."):
     df = load_data(PARQUET_FILE_ID)
 
@@ -310,7 +298,6 @@ if st.session_state["selected_pref"] not in pref_options:
 if "pref_selectbox" not in st.session_state or st.session_state["pref_selectbox"] not in pref_options:
     st.session_state["pref_selectbox"] = st.session_state["selected_pref"]
 
-# サイドバー：検索・プルダウン選択・リセット
 st.sidebar.header("🔍 エリア検索・選択")
 
 search_query = st.sidebar.text_input(
@@ -355,7 +342,6 @@ with col_sb2:
 selected_pref = st.session_state["selected_pref"]
 is_pref_selected = selected_pref != "（すべて）"
 
-# メイン画面：地方別都道府県ボタン選択UI（初期画面の軽量化＆直感的選択）
 with st.expander("🗾 地方・都道府県ボタンから選ぶ", expanded=not is_pref_selected):
     st.caption("地方ブロックごとのボタンから都道府県を選ぶと、対象エリアのヒートマップ・グリッド地図を表示します（初期表示は軽量化のためヒートマップ未描画）。")
     for region_name, region_prefs in REGIONS:
@@ -396,7 +382,6 @@ m2.metric("総人口", f"{total_pop:,} 人")
 m3.metric("総世帯数", f"{total_households:,} 世帯")
 m4.metric("対象エリア数", f"{area_count:,} 件")
 
-# 都道府県選択時のみヒートマップ＋（ズーム13以上で）グリッド地図を表示
 if is_pref_selected and len(filtered_df) > 0:
     if selected_pref in PREF_CENTERS:
         center_lat, center_lon = PREF_CENTERS[selected_pref]
