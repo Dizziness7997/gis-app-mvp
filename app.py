@@ -1,6 +1,7 @@
 import gc
 import json
 import os
+import re
 import textwrap
 
 import folium
@@ -54,26 +55,26 @@ class ZoomHeatGridSwitcher(folium.MacroElement):
         heat_var = heat_layer.get_name()
         grid_var = grid_layer.get_name()
         raw_js = textwrap.dedent("""
-            {% macro script(this, kwargs) %}
-            var map = __MAP_VAR__;
-            var heatLayer = __HEAT_VAR__;
-            var gridLayer = __GRID_VAR__;
+        {% macro script(this, kwargs) %}
+        var map = __MAP_VAR__;
+        var heatLayer = __HEAT_VAR__;
+        var gridLayer = __GRID_VAR__;
 
-            function toggleByZoom() {
-                var z = map.getZoom();
-                if (z >= __ZOOM_THRESHOLD__) {
-                    if (map.hasLayer(heatLayer)) { map.removeLayer(heatLayer); }
-                    if (!map.hasLayer(gridLayer)) { map.addLayer(gridLayer); }
-                } else {
-                    if (map.hasLayer(gridLayer)) { map.removeLayer(gridLayer); }
-                    if (!map.hasLayer(heatLayer)) { map.addLayer(heatLayer); }
-                }
+        function toggleByZoom() {
+            var z = map.getZoom();
+            if (z >= __ZOOM_THRESHOLD__) {
+                if (map.hasLayer(heatLayer)) { map.removeLayer(heatLayer); }
+                if (!map.hasLayer(gridLayer)) { map.addLayer(gridLayer); }
+            } else {
+                if (map.hasLayer(gridLayer)) { map.removeLayer(gridLayer); }
+                if (!map.hasLayer(heatLayer)) { map.addLayer(heatLayer); }
             }
+        }
 
-            map.on('zoomend', toggleByZoom);
-            toggleByZoom();
-            {% endmacro %}
-            """).strip()
+        map.on('zoomend', toggleByZoom);
+        toggleByZoom();
+        {% endmacro %}
+        """).strip()
         js_body = (
             raw_js
             .replace("__MAP_VAR__", map_var)
@@ -176,48 +177,32 @@ def load_boundaries(geojson_file_id: str):
     with open(output, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    if isinstance(data, dict) and isinstance(data.get("features"), list):
-        return data
-    return {"type": "FeatureCollection", "features": []}
+    if not (isinstance(data, dict) and isinstance(data.get("features"), list)):
+        return {"type": "FeatureCollection", "features": []}
 
-
-def filter_boundary_features(
-    boundaries_data,
-    selected_pref,
-    pref_kw,
-    selected_city,
-    city_kw,
-    available_prefs,
-    city_candidates,
-):
-    features = boundaries_data.get("features", [])
-    matched = []
-
-    matched_prefs = set()
-    if selected_pref != "（すべて）":
-        matched_prefs.add(selected_pref)
-    elif pref_kw.strip():
-        matched_prefs.update(p for p in available_prefs if pref_kw.strip() in p)
-
-    matched_cities = set()
-    if selected_city != "（すべて）":
-        matched_cities.add(selected_city)
-    elif city_kw.strip():
-        matched_cities.update(c for c in city_candidates if city_kw.strip() in c)
-
-    for feat in features:
-        props = feat.get("properties") or {}
+    normalized_features = []
+    for feat in data["features"]:
+        props = dict(feat.get("properties") or {})
         p_val = str(props.get("PREF_NAME") or props.get("N03_001") or "").strip()
-        c_val = str(props.get("CITY_NAME") or props.get("N03_004") or "").strip()
+        if p_val:
+            props["PREF_NAME"] = p_val
+            feat_copy = dict(feat)
+            feat_copy["properties"] = props
+            normalized_features.append(feat_copy)
 
-        if matched_cities:
-            if c_val in matched_cities and (not matched_prefs or p_val in matched_prefs):
-                matched.append(feat)
-        elif matched_prefs:
-            if p_val in matched_prefs:
-                matched.append(feat)
+    return {"type": "FeatureCollection", "features": normalized_features}
 
-    return {"type": "FeatureCollection", "features": matched}
+
+def extract_pref_from_tooltip(tooltip_text: str | None) -> str | None:
+    if not tooltip_text or not isinstance(tooltip_text, str):
+        return None
+    cleaned = re.sub(r"^都道府県\s*[:：]\s*", "", tooltip_text.strip()).strip()
+    if cleaned in PREF_LIST:
+        return cleaned
+    for pref in PREF_LIST:
+        if pref in cleaned:
+            return pref
+    return None
 
 
 def add_base_tiles(m):
@@ -243,70 +228,48 @@ with st.spinner("軽量データと行政界データを読み込んでいます
     df = load_data(PARQUET_FILE_ID)
     boundaries_data = load_boundaries(GEOJSON_FILE_ID)
 
-st.sidebar.header("🔍 エリア絞り込み")
+if "selected_pref" not in st.session_state:
+    st.session_state["selected_pref"] = "（すべて）"
+if "prev_clicked_tooltip" not in st.session_state:
+    st.session_state["prev_clicked_tooltip"] = None
+
+st.sidebar.header("🔍 エリア選択")
 
 if st.sidebar.button("キャッシュ再取得（データ更新時）"):
     for fname in ["small_area_slim.parquet", "admin_boundaries_slim.geojson"]:
         if os.path.exists(fname):
             os.remove(fname)
     st.cache_data.clear()
+    st.session_state["selected_pref"] = "（すべて）"
+    st.session_state["prev_clicked_tooltip"] = None
     st.rerun()
-
-pref_keyword = st.sidebar.text_input("都道府県を文字で絞り込み", placeholder="例：新潟県、北海道")
 
 available_prefs = [p for p in PREF_LIST if p in set(df["PREF_NAME"].dropna().astype(str).unique())]
 if not available_prefs:
     available_prefs = sorted([p for p in df["PREF_NAME"].dropna().astype(str).unique() if p != ""])
 
-pref_options = ["（すべて）"] + [
-    p for p in available_prefs if not pref_keyword.strip() or pref_keyword.strip() in p
-]
-selected_pref = st.sidebar.selectbox("都道府県を選択", pref_options, index=0)
+pref_options = ["（すべて）"] + available_prefs
 
-city_keyword = st.sidebar.text_input("市区町村を文字で絞り込み", placeholder="例：上越市、新潟市")
+if st.session_state["selected_pref"] not in pref_options:
+    st.session_state["selected_pref"] = "（すべて）"
 
-if selected_pref != "（すべて）":
-    pref_filtered_df = df[df["PREF_NAME"].astype(str) == selected_pref]
-elif pref_keyword.strip():
-    matched_p = [p for p in available_prefs if pref_keyword.strip() in p]
-    pref_filtered_df = df[df["PREF_NAME"].astype(str).isin(matched_p)]
-else:
-    pref_filtered_df = df
-
-city_candidates = sorted(
-    [c for c in pref_filtered_df["CITY_NAME"].dropna().astype(str).unique() if c != ""]
-)
-city_options = ["（すべて）"] + [
-    c for c in city_candidates if not city_keyword.strip() or city_keyword.strip() in c
-]
-selected_city = st.sidebar.selectbox("市区町村を選択", city_options, index=0)
-
-is_filtered = (
-    selected_pref != "（すべて）"
-    or bool(pref_keyword.strip())
-    or selected_city != "（すべて）"
-    or bool(city_keyword.strip())
+selected_pref = st.sidebar.selectbox(
+    "都道府県を選択（地図クリックでも選択可能）",
+    pref_options,
+    key="selected_pref",
 )
 
-filtered_df = pref_filtered_df.copy()
-if selected_city != "（すべて）":
-    filtered_df = filtered_df[filtered_df["CITY_NAME"].astype(str) == selected_city]
-elif city_keyword.strip():
-    matched_c = [c for c in city_candidates if city_keyword.strip() in c]
-    filtered_df = filtered_df[filtered_df["CITY_NAME"].astype(str).isin(matched_c)]
+is_pref_selected = selected_pref != "（すべて）"
 
-if not is_filtered:
-    area_label = "未選択（日本広域）"
+if not is_pref_selected:
+    filtered_df = df.iloc[0:0]
+    area_label = "未選択（地図クリックまたは選択肢から都道府県を選択）"
     total_pop = 0
     total_households = 0
     area_count = 0
 else:
-    if selected_city != "（すべて）":
-        area_label = f"{selected_pref} {selected_city}" if selected_pref != "（すべて）" else selected_city
-    elif selected_pref != "（すべて）":
-        area_label = selected_pref
-    else:
-        area_label = "条件一致エリア"
+    filtered_df = df[df["PREF_NAME"].astype(str) == selected_pref]
+    area_label = selected_pref
     total_pop = int(filtered_df["JINKO"].sum())
     total_households = int(filtered_df["SETAI"].sum())
     area_count = int(len(filtered_df))
@@ -317,10 +280,15 @@ m2.metric("総人口", f"{total_pop:,} 人")
 m3.metric("総世帯数", f"{total_households:,} 世帯")
 m4.metric("対象エリア数", f"{area_count:,} 件")
 
-if is_filtered and len(filtered_df) > 0:
-    center_lat = float(filtered_df["Y_CODE"].mean())
-    center_lon = float(filtered_df["X_CODE"].mean())
-    zoom_start = 11 if selected_city != "（すべて）" else 9
+if is_pref_selected and len(filtered_df) > 0:
+    pref_idx = PREF_LIST.index(selected_pref) if selected_pref in PREF_LIST else None
+    if pref_idx is not None:
+        center_lat = float(PREF_CENTERS[pref_idx, 0])
+        center_lon = float(PREF_CENTERS[pref_idx, 1])
+    else:
+        center_lat = float(filtered_df["Y_CODE"].mean())
+        center_lon = float(filtered_df["X_CODE"].mean())
+    zoom_start = 9
 else:
     center_lat, center_lon = 36.5, 138.0
     zoom_start = 5
@@ -328,36 +296,30 @@ else:
 m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None, control_scale=True)
 add_base_tiles(m)
 
-matched_boundaries = filter_boundary_features(
-    boundaries_data,
-    selected_pref,
-    pref_keyword,
-    selected_city,
-    city_keyword,
-    available_prefs,
-    city_candidates,
-)
-if is_filtered and matched_boundaries["features"]:
+if not is_pref_selected and boundaries_data["features"]:
     folium.GeoJson(
-        matched_boundaries,
-        name="行政界ポリゴン",
+        boundaries_data,
+        name="都道府県境界線（クリックで選択）",
         style_function=lambda _: {
             "color": "#1f4e78",
-            "weight": 2,
+            "weight": 1.5,
             "fillColor": "#4a90e2",
-            "fillOpacity": 0.08,
+            "fillOpacity": 0.12,
+        },
+        highlight_function=lambda _: {
+            "color": "#d95f02",
+            "weight": 2.5,
+            "fillColor": "#fdae61",
+            "fillOpacity": 0.35,
         },
         tooltip=folium.GeoJsonTooltip(
-            fields=[
-                k for k in ["PREF_NAME", "CITY_NAME"]
-                if k in (matched_boundaries["features"][0].get("properties") or {})
-            ],
-            aliases=["都道府県", "市区町村"],
+            fields=["PREF_NAME"],
+            aliases=["都道府県"],
             localize=True,
         ),
     ).add_to(m)
 
-if is_filtered and len(filtered_df) > 0:
+if is_pref_selected and len(filtered_df) > 0:
     if len(filtered_df) > MAX_HEATMAP_POINTS:
         st.caption(f"※描画サイズ抑制のため、ヒートマップは {len(filtered_df):,} 件から {MAX_HEATMAP_POINTS:,} 件を抽出して表示しています。")
         heat_df = filtered_df.sample(n=MAX_HEATMAP_POINTS, random_state=42)
@@ -404,4 +366,18 @@ if is_filtered and len(filtered_df) > 0:
     gc.collect()
 
 folium.LayerControl(collapsed=True).add_to(m)
-st_folium(m, width="100%", height=620, returned_objects=[])
+
+map_state = st_folium(
+    m,
+    width="100%",
+    height=620,
+    returned_objects=["last_object_clicked_tooltip"],
+)
+
+clicked_tooltip = (map_state or {}).get("last_object_clicked_tooltip")
+if clicked_tooltip and clicked_tooltip != st.session_state["prev_clicked_tooltip"]:
+    st.session_state["prev_clicked_tooltip"] = clicked_tooltip
+    clicked_pref = extract_pref_from_tooltip(clicked_tooltip)
+    if clicked_pref and clicked_pref != st.session_state["selected_pref"]:
+        st.session_state["selected_pref"] = clicked_pref
+        st.rerun()
