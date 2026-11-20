@@ -7,6 +7,7 @@ from folium.plugins import HeatMap
 import gdown
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import streamlit as st
 from streamlit_folium import st_folium
 
@@ -134,9 +135,10 @@ SHORT_PREF_LABELS = {
 
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
 
-MAX_HEATMAP_POINTS = 10000
-MAX_GRID_POINTS = 800
-MAX_CITIES_PER_VIEW = 25
+MAX_HEATMAP_POINTS = 4000
+MAX_GRID_POINTS = 350
+MAX_CITIES_PER_VIEW = 20
+BATCH_ROWS = 100000
 
 
 class ZoomHeatGridSwitcher(folium.MacroElement):
@@ -185,6 +187,17 @@ def _ensure_parquet_local(parquet_file_id: str, output_path: str = "small_area_s
     return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
 
+def _iter_parquet_batches(path: str, cols_wanted: list[str], batch_size: int = BATCH_ROWS):
+    """PyArrowでバッチ単位に読み出し、Python/Pandasオブジェクトを最小化して返す"""
+    pf = pq.ParquetFile(path)
+    schema_cols = set(pf.schema_arrow.names)
+    use_cols = [c for c in cols_wanted if c in schema_cols]
+    for record_batch in pf.iter_batches(batch_size=batch_size, columns=use_cols):
+        batch_df = record_batch.to_pandas(types_mapper=None)
+        del record_batch
+        yield batch_df
+
+
 def _extract_pref_series(df: pd.DataFrame) -> pd.Series:
     code_col = next((c for c in ["PREF_CODE", "CITY_CODE", "KEY_CODE"] if c in df.columns), None)
     if code_col:
@@ -198,6 +211,7 @@ def _extract_pref_series(df: pd.DataFrame) -> pd.Series:
         )
         code_map = {f"{i+1:02d}": PREF_LIST[i] for i in range(47)}
         pref_series = codes2.map(code_map).fillna("")
+        del codes2
     else:
         pref_series = pd.Series("", index=df.index, dtype=str)
 
@@ -208,16 +222,14 @@ def _extract_pref_series(df: pd.DataFrame) -> pd.Series:
             index=df.index,
             dtype=str,
         )
+        del raw_pref
 
     if (pref_series == "").any() and {"CITY_NAME", "X_CODE", "Y_CODE"}.issubset(df.columns):
-        valid_mask = (
-            (df["CITY_NAME"].fillna("").astype(str) != "")
-            & df["X_CODE"].notna()
-            & df["Y_CODE"].notna()
-        )
+        city_col_str = df["CITY_NAME"].fillna("").astype(str)
+        valid_mask = (city_col_str != "") & df["X_CODE"].notna() & df["Y_CODE"].notna()
         if valid_mask.any():
             valid_df = pd.DataFrame({
-                "CITY_NAME": df.loc[valid_mask, "CITY_NAME"].astype(str),
+                "CITY_NAME": city_col_str.loc[valid_mask],
                 "Y_CODE": pd.to_numeric(df.loc[valid_mask, "Y_CODE"], errors="coerce"),
                 "X_CODE": pd.to_numeric(df.loc[valid_mask, "X_CODE"], errors="coerce"),
             }).dropna()
@@ -227,118 +239,155 @@ def _extract_pref_series(df: pd.DataFrame) -> pd.Series:
                 dists = ((coords - PREF_CENTERS_ARR[None, :, :]) ** 2).sum(axis=2)
                 nearest_idx = dists.argmin(axis=1)
                 city_to_pref = dict(zip(city_coords.index, [PREF_LIST[i] for i in nearest_idx]))
-                mask_empty = (pref_series == "") & (df["CITY_NAME"].fillna("").astype(str) != "")
+                mask_empty = (pref_series == "") & (city_col_str != "")
                 pref_series = pref_series.copy()
-                pref_series.loc[mask_empty] = df.loc[mask_empty, "CITY_NAME"].astype(str).map(city_to_pref).fillna("")
-                del valid_df, city_coords, coords, dists
+                pref_series.loc[mask_empty] = city_col_str.loc[mask_empty].map(city_to_pref).fillna("")
+                del valid_df, city_coords, coords, dists, nearest_idx, city_to_pref, mask_empty
+        del city_col_str
 
     return pref_series
 
 
 @st.cache_data(show_spinner=False)
 def load_pref_summary(parquet_file_id: str) -> pd.DataFrame:
-    """都道府県別サマリー（集計値と都道府県一覧のみ）をキャッシュする"""
+    """バッチ読込で都道府県別サマリー（集計値と都道府県一覧のみ）をキャッシュする"""
     output = "small_area_slim.parquet"
     if not _ensure_parquet_local(parquet_file_id, output):
         return pd.DataFrame(columns=["PREF_NAME", "JINKO", "SETAI", "AREA_COUNT"])
 
-    cols_available = ["PREF_NAME", "PREF_CODE", "CITY_CODE", "KEY_CODE", "CITY_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"]
-    df = pd.read_parquet(output, columns=[c for c in cols_available if c in pd.read_parquet(output, columns=None).columns] if False else None)
-    keep_cols = [c for c in cols_available if c in df.columns]
-    df = df[keep_cols]
+    cols_wanted = ["PREF_NAME", "PREF_CODE", "CITY_CODE", "KEY_CODE", "CITY_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"]
+    parts = []
 
-    jinko = pd.to_numeric(df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int64)
-    setai = pd.to_numeric(df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int64)
-    pref_series = _extract_pref_series(df)
+    for batch_df in _iter_parquet_batches(output, cols_wanted, batch_size=BATCH_ROWS):
+        if len(batch_df) == 0:
+            del batch_df
+            continue
+        jinko = pd.to_numeric(batch_df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int64)
+        setai = pd.to_numeric(batch_df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int64)
+        pref_series = _extract_pref_series(batch_df)
 
-    summary_df = pd.DataFrame({
-        "PREF_NAME": pref_series,
-        "JINKO": jinko,
-        "SETAI": setai,
-        "AREA_COUNT": np.ones(len(df), dtype=np.int64),
-    })
-    summary_df = summary_df[summary_df["PREF_NAME"] != ""].groupby("PREF_NAME", as_index=False).sum()
+        part_df = pd.DataFrame({
+            "PREF_NAME": pref_series,
+            "JINKO": jinko,
+            "SETAI": setai,
+            "AREA_COUNT": np.ones(len(batch_df), dtype=np.int64),
+        })
+        part_df = part_df[part_df["PREF_NAME"] != ""].groupby("PREF_NAME", as_index=False).sum()
+        parts.append(part_df)
+        del batch_df, pref_series, jinko, setai, part_df
+        gc.collect()
 
-    del df, pref_series, jinko, setai
+    if not parts:
+        return pd.DataFrame(columns=["PREF_NAME", "JINKO", "SETAI", "AREA_COUNT"])
+
+    summary_df = pd.concat(parts, ignore_index=True).groupby("PREF_NAME", as_index=False).sum()
+    del parts
     gc.collect()
     return summary_df
 
 
 @st.cache_data(show_spinner=False)
 def load_city_index(parquet_file_id: str, target_pref: str) -> pd.DataFrame:
-    """選択された都道府県の市区町村一覧（件数・人口・世帯数）を軽量に取得する"""
+    """バッチ読込で選択都道府県の市区町村一覧（件数・人口・世帯数）を軽量に取得する"""
     output = "small_area_slim.parquet"
     if not target_pref or target_pref == "（すべて）" or not _ensure_parquet_local(parquet_file_id, output):
         return pd.DataFrame(columns=["CITY_NAME", "JINKO", "SETAI", "AREA_COUNT"])
 
     cols_wanted = ["PREF_NAME", "PREF_CODE", "CITY_CODE", "KEY_CODE", "CITY_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"]
-    df = pd.read_parquet(output)
-    keep_cols = [c for c in cols_wanted if c in df.columns]
-    df = df[keep_cols]
+    parts = []
 
-    pref_series = _extract_pref_series(df)
-    mask = (pref_series == target_pref).to_numpy()
-    df = df.loc[mask].copy()
-    del pref_series
+    for batch_df in _iter_parquet_batches(output, cols_wanted, batch_size=BATCH_ROWS):
+        if len(batch_df) == 0:
+            del batch_df
+            continue
+        pref_series = _extract_pref_series(batch_df)
+        mask = (pref_series == target_pref).to_numpy()
+        del pref_series
+        if not mask.any():
+            del batch_df, mask
+            continue
 
-    if len(df) == 0:
-        return pd.DataFrame(columns=["CITY_NAME", "JINKO", "SETAI", "AREA_COUNT"])
+        sub = batch_df.loc[mask].copy()
+        del batch_df, mask
+        sub["CITY_NAME"] = sub.get("CITY_NAME", "不明").fillna("不明").astype(str)
+        sub["JINKO"] = pd.to_numeric(sub.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int64)
+        sub["SETAI"] = pd.to_numeric(sub.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int64)
 
-    df["CITY_NAME"] = df.get("CITY_NAME", "").fillna("不明").astype(str)
-    df["JINKO"] = pd.to_numeric(df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int64)
-    df["SETAI"] = pd.to_numeric(df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int64)
-
-    city_df = (
-        df.groupby("CITY_NAME", as_index=False)
-        .agg(
+        part_city = sub.groupby("CITY_NAME", as_index=False).agg(
             JINKO=("JINKO", "sum"),
             SETAI=("SETAI", "sum"),
             AREA_COUNT=("CITY_NAME", "count"),
         )
+        parts.append(part_city)
+        del sub, part_city
+        gc.collect()
+
+    if not parts:
+        return pd.DataFrame(columns=["CITY_NAME", "JINKO", "SETAI", "AREA_COUNT"])
+
+    city_df = (
+        pd.concat(parts, ignore_index=True)
+        .groupby("CITY_NAME", as_index=False)
+        .agg(
+            JINKO=("JINKO", "sum"),
+            SETAI=("SETAI", "sum"),
+            AREA_COUNT=("AREA_COUNT", "sum"),
+        )
         .sort_values(["JINKO", "CITY_NAME"], ascending=[False, True])
         .reset_index(drop=True)
     )
-    del df
+    del parts
     gc.collect()
     return city_df
 
 
 @st.cache_data(show_spinner=False)
 def load_city_chunk_data(parquet_file_id: str, target_pref: str, selected_cities: tuple[str, ...]) -> pd.DataFrame:
-    """選択された市区町村チャンク分の小地域データのみを抽出する"""
+    """バッチ読込で選択市区町村チャンク分の小地域データのみを抽出する"""
     output = "small_area_slim.parquet"
     if not target_pref or target_pref == "（すべて）" or not selected_cities or not _ensure_parquet_local(parquet_file_id, output):
         return pd.DataFrame(columns=["PREF_NAME", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"])
 
     cols_wanted = ["PREF_NAME", "PREF_CODE", "CITY_CODE", "KEY_CODE", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"]
-    df = pd.read_parquet(output)
-    keep_cols = [c for c in cols_wanted if c in df.columns]
-    df = df[keep_cols]
+    city_set = set(selected_cities)
+    parts = []
 
-    pref_series = _extract_pref_series(df)
-    city_series = df.get("CITY_NAME", pd.Series("不明", index=df.index)).fillna("不明").astype(str)
-    mask = ((pref_series == target_pref) & city_series.isin(set(selected_cities))).to_numpy()
-    df = df.loc[mask].copy()
-    del pref_series, city_series
+    for batch_df in _iter_parquet_batches(output, cols_wanted, batch_size=BATCH_ROWS):
+        if len(batch_df) == 0:
+            del batch_df
+            continue
+        pref_series = _extract_pref_series(batch_df)
+        city_series = batch_df.get("CITY_NAME", pd.Series("不明", index=batch_df.index)).fillna("不明").astype(str)
+        mask = ((pref_series == target_pref) & city_series.isin(city_set)).to_numpy()
+        del pref_series, city_series
+        if not mask.any():
+            del batch_df, mask
+            continue
 
-    if len(df) == 0:
+        sub = batch_df.loc[mask].copy()
+        del batch_df, mask
+        sub["PREF_NAME"] = target_pref
+        sub["JINKO"] = pd.to_numeric(sub.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int32)
+        sub["SETAI"] = pd.to_numeric(sub.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int32)
+        sub["X_CODE"] = pd.to_numeric(sub["X_CODE"], errors="coerce").astype(np.float32)
+        sub["Y_CODE"] = pd.to_numeric(sub["Y_CODE"], errors="coerce").astype(np.float32)
+        sub = sub.dropna(subset=["X_CODE", "Y_CODE"])
+        sub["CITY_NAME"] = sub.get("CITY_NAME", "").fillna("").astype(str)
+        sub["S_NAME"] = sub["S_NAME"].fillna("不明").astype(str) if "S_NAME" in sub.columns else "不明"
+
+        keep_out = ["PREF_NAME", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"]
+        sub = sub[[c for c in keep_out if c in sub.columns]]
+        parts.append(sub)
+        del sub
+        gc.collect()
+
+    if not parts:
         return pd.DataFrame(columns=["PREF_NAME", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"])
 
-    df["PREF_NAME"] = target_pref
-    df["JINKO"] = pd.to_numeric(df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int32)
-    df["SETAI"] = pd.to_numeric(df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int32)
-    df["X_CODE"] = pd.to_numeric(df["X_CODE"], errors="coerce").astype(np.float32)
-    df["Y_CODE"] = pd.to_numeric(df["Y_CODE"], errors="coerce").astype(np.float32)
-    df = df.dropna(subset=["X_CODE", "Y_CODE"]).reset_index(drop=True)
-    df["CITY_NAME"] = df.get("CITY_NAME", "").fillna("").astype(str)
-    df["S_NAME"] = df["S_NAME"].fillna("不明").astype(str) if "S_NAME" in df.columns else "不明"
-
-    drop_cols = [c for c in ["PREF_CODE", "CITY_CODE", "KEY_CODE"] if c in df.columns]
-    if drop_cols:
-        df = df.drop(columns=drop_cols)
-
+    out_df = pd.concat(parts, ignore_index=True)
+    del parts
     gc.collect()
-    return df
+    return out_df
 
 
 def add_base_tiles(m):
@@ -367,20 +416,35 @@ def set_selected_pref(pref_name: str):
     st.session_state["selected_cities"] = []
 
 
-with st.spinner("都道府県別サマリーを読み込んでいます..."):
-    summary_df = load_pref_summary(PARQUET_FILE_ID)
-
 if "selected_pref" not in st.session_state:
     st.session_state["selected_pref"] = "（すべて）"
 if "city_page" not in st.session_state:
     st.session_state["city_page"] = 0
 if "selected_cities" not in st.session_state:
     st.session_state["selected_cities"] = []
+if "load_summary_requested" not in st.session_state:
+    st.session_state["load_summary_requested"] = False
 
-available_prefs_set = set(summary_df["PREF_NAME"].dropna().astype(str).unique())
-available_prefs = [p for p in PREF_LIST if p in available_prefs_set]
-if not available_prefs:
-    available_prefs = PREF_LIST.copy()
+st.sidebar.header("🔍 エリア検索・選択")
+
+# 初期起動時の自動バッチ走査をオフにできるようにし、メモリ超過（Oh no.）を防止
+auto_scan_summary = st.sidebar.checkbox(
+    "起動時に全国サマリーを自動集計する",
+    value=False,
+    help="オフにすると初回起動時のメモリ消費を最小限に抑えます（都道府県一覧は全47都道府県から選択可能）。",
+)
+
+if auto_scan_summary or st.session_state["load_summary_requested"]:
+    with st.spinner("都道府県別サマリーを読み込んでいます..."):
+        summary_df = load_pref_summary(PARQUET_FILE_ID)
+else:
+    summary_df = pd.DataFrame(columns=["PREF_NAME", "JINKO", "SETAI", "AREA_COUNT"])
+    if st.sidebar.button("全国サマリーを集計する", use_container_width=True):
+        st.session_state["load_summary_requested"] = True
+        st.rerun()
+
+available_prefs_set = set(summary_df["PREF_NAME"].dropna().astype(str).unique()) if len(summary_df) > 0 else set()
+available_prefs = [p for p in PREF_LIST if p in available_prefs_set] if available_prefs_set else PREF_LIST.copy()
 
 pref_options = ["（すべて）"] + available_prefs
 
@@ -388,8 +452,6 @@ if st.session_state["selected_pref"] not in pref_options:
     st.session_state["selected_pref"] = "（すべて）"
 if "pref_selectbox" not in st.session_state or st.session_state["pref_selectbox"] not in pref_options:
     st.session_state["pref_selectbox"] = st.session_state["selected_pref"]
-
-st.sidebar.header("🔍 エリア検索・選択")
 
 search_query = st.sidebar.text_input(
     "都道府県を検索（例: 新潟、東京、大阪）",
@@ -433,6 +495,7 @@ with col_sb2:
         if os.path.exists("small_area_slim.parquet"):
             os.remove("small_area_slim.parquet")
         st.cache_data.clear()
+        st.session_state["load_summary_requested"] = False
         set_selected_pref("（すべて）")
         st.rerun()
 
@@ -440,7 +503,7 @@ selected_pref = st.session_state["selected_pref"]
 is_pref_selected = selected_pref != "（すべて）"
 
 with st.expander("🗺️ 地方・都道府県ボタンから選ぶ", expanded=not is_pref_selected):
-    st.caption("1) 都道府県を選ぶ → 2) 市区町村チャンク（またはページ）を選ぶと地図を描画します（メモリ保護のため段階分割）。")
+    st.caption("1) 都道府県を選ぶ → 2) 市区町村チャンク（1〜3件推奨）を選ぶと地図を描画します（メモリ節約モード）。")
     for region_name, region_prefs in REGIONS:
         present_prefs = [p for p in region_prefs if p in available_prefs]
         if not present_prefs:
@@ -468,8 +531,8 @@ if not is_pref_selected:
     total_households = 0
     area_count = 0
 else:
-    pref_row = summary_df[summary_df["PREF_NAME"] == selected_pref]
     area_label = selected_pref
+    pref_row = summary_df[summary_df["PREF_NAME"] == selected_pref] if len(summary_df) > 0 else pd.DataFrame()
     if len(pref_row) > 0:
         total_pop = int(pref_row["JINKO"].iloc[0])
         total_households = int(pref_row["SETAI"].iloc[0])
@@ -481,6 +544,11 @@ else:
 
     with st.spinner(f"{selected_pref} の市区町村一覧を取得しています..."):
         city_index_df = load_city_index(PARQUET_FILE_ID, selected_pref)
+
+    if len(city_index_df) > 0 and (total_pop == 0 and total_households == 0 and area_count == 0):
+        total_pop = int(city_index_df["JINKO"].sum())
+        total_households = int(city_index_df["SETAI"].sum())
+        area_count = int(city_index_df["AREA_COUNT"].sum())
 
     all_city_names = city_index_df["CITY_NAME"].tolist()
     total_cities = len(all_city_names)
@@ -505,8 +573,8 @@ else:
             st.session_state["selected_cities"] = []
             st.rerun()
     with c_nav3:
-        if st.button("このページの先頭5市区町村を読込", disabled=(len(page_cities) == 0), use_container_width=True):
-            st.session_state["selected_cities"] = page_cities[:5]
+        if st.button("先頭2市区町村を読込", disabled=(len(page_cities) == 0), use_container_width=True):
+            st.session_state["selected_cities"] = page_cities[:2]
             st.rerun()
     with c_nav4:
         if st.button("地図描画をクリア", use_container_width=True):
@@ -515,12 +583,12 @@ else:
 
     st.caption(
         f"全 {total_cities} 市区町村のうち {page_start + 1}〜{page_end} 件目を表示中 "
-        f"（ページ {current_page + 1} / {total_pages}）。1度に描画する市区町村を絞ることでメモリ超過を防ぎます。"
+        f"（ページ {current_page + 1} / {total_pages}）。1度に読み込む市区町村を1〜2件に絞ると安定しやすくなります。"
     )
 
     valid_selected = [c for c in st.session_state["selected_cities"] if c in set(all_city_names)]
     chosen_cities = st.multiselect(
-        "描画する市区町村を選択（複数可・推奨 1〜8 市区町村）",
+        "描画する市区町村を選択（複数可・推奨 1〜2 市区町村）",
         options=page_cities if page_cities else all_city_names,
         default=[c for c in valid_selected if c in set(page_cities)] if page_cities else valid_selected,
         key="city_chunk_multiselect",
@@ -601,6 +669,6 @@ if is_pref_selected and len(filtered_df) > 0:
         returned_objects=[],
     )
 elif is_pref_selected:
-    st.info("「🧩 市区町村チャンク分割」から描画したい市区町村を選択（または「このページの先頭5市区町村を読込」をクリック）してください。")
+    st.info("「🧩 市区町村チャンク分割」から描画したい市区町村を選択（または「先頭2市区町村を読込」をクリック）してください。")
 else:
     st.info("地方ブロックの都道府県ボタン、サイドバーの検索、またはプルダウンから都道府県を選択してください。")
