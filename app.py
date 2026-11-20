@@ -1,15 +1,15 @@
-import os
 import gc
 import json
+import os
 import textwrap
-import streamlit as st
-import pandas as pd
-import numpy as np
+
 import folium
 from folium.plugins import HeatMap
-from streamlit_folium import st_folium
-from branca.element import MacroElement, Template
 import gdown
+import numpy as np
+import pandas as pd
+import streamlit as st
+from streamlit_folium import st_folium
 
 st.set_page_config(page_title="GIS・商圏分析システム MVP", layout="wide")
 st.title("🗺️ GIS・商圏分析システム (MVP)")
@@ -42,92 +42,125 @@ PREF_CENTERS = np.array([
 PARQUET_FILE_ID = "1Cog9sWsi9vh9HKSNYKK2wf2q8HG-kOXj"
 GEOJSON_FILE_ID = "13LAo42gRdBajjeaT95Xx0x8krjlfINFj"
 
+MAX_HEATMAP_POINTS = 15000
+MAX_GRID_POINTS = 1500
 
-class ZoomHeatGridSwitcher(MacroElement):
+
+class ZoomHeatGridSwitcher(folium.MacroElement):
     def __init__(self, heat_layer, grid_layer, zoom_threshold=13):
         super().__init__()
         self._name = "ZoomHeatGridSwitcher"
         map_var = "{{ this._parent.get_name() }}"
         heat_var = heat_layer.get_name()
         grid_var = grid_layer.get_name()
-        js_body = textwrap.dedent(f'''
-        {{% macro script(this, kwargs) %}}
-        var map = {map_var};
-        var heatLayer = {heat_var};
-        var gridLayer = {grid_var};
+        js_body = textwrap.dedent(f"""
+            {% macro script(this, kwargs) %}
+            var map = {map_var};
+            var heatLayer = {heat_var};
+            var gridLayer = {grid_var};
 
-        function toggleByZoom() {{
-            var z = map.getZoom();
-            if (z >= {zoom_threshold}) {{
-                if (map.hasLayer(heatLayer)) {{ map.removeLayer(heatLayer); }}
-                if (!map.hasLayer(gridLayer)) {{ map.addLayer(gridLayer); }}
-            }} else {{
-                if (map.hasLayer(gridLayer)) {{ map.removeLayer(gridLayer); }}
-                if (!map.hasLayer(heatLayer)) {{ map.addLayer(heatLayer); }}
+            function toggleByZoom() {{
+                var z = map.getZoom();
+                if (z >= {zoom_threshold}) {{
+                    if (map.hasLayer(heatLayer)) {{ map.removeLayer(heatLayer); }}
+                    if (!map.hasLayer(gridLayer)) {{ map.addLayer(gridLayer); }}
+                }} else {{
+                    if (map.hasLayer(gridLayer)) {{ map.removeLayer(gridLayer); }}
+                    if (!map.hasLayer(heatLayer)) {{ map.addLayer(heatLayer); }}
+                }}
             }}
-        }}
 
-        map.on('zoomend', toggleByZoom);
-        toggleByZoom();
-        {{% endmacro %}}
-        ''').strip()
-        self._template = Template(js_body)
+            map.on('zoomend', toggleByZoom);
+            toggleByZoom();
+            {% endmacro %}
+            """).strip()
+        self._template = folium.Template(js_body)
 
 
 @st.cache_data(show_spinner=False)
-def load_data():
+def load_data(parquet_file_id: str):
     output = "small_area_slim.parquet"
 
     if not os.path.exists(output):
-        url = f"https://drive.google.com/uc?id={PARQUET_FILE_ID}"
+        url = f"https://drive.google.com/uc?id={parquet_file_id}"
         gdown.download(url, output, quiet=True)
 
+    if not os.path.exists(output):
+        return pd.DataFrame(columns=["PREF_NAME", "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"])
+
+    cols_wanted = [
+        "PREF_NAME", "PREF_CODE", "CITY_CODE", "KEY_CODE",
+        "CITY_NAME", "S_NAME", "X_CODE", "Y_CODE", "JINKO", "SETAI"
+    ]
     df = pd.read_parquet(output)
-    df["JINKO"] = pd.to_numeric(df["JINKO"], errors="coerce").fillna(0).astype(np.int32)
-    df["SETAI"] = pd.to_numeric(df["SETAI"], errors="coerce").fillna(0).astype(np.int32)
+    keep_cols = [c for c in cols_wanted if c in df.columns]
+    df = df[keep_cols]
+
+    df["JINKO"] = pd.to_numeric(df.get("JINKO", 0), errors="coerce").fillna(0).astype(np.int32)
+    df["SETAI"] = pd.to_numeric(df.get("SETAI", 0), errors="coerce").fillna(0).astype(np.int32)
     df["X_CODE"] = pd.to_numeric(df["X_CODE"], errors="coerce").astype(np.float32)
     df["Y_CODE"] = pd.to_numeric(df["Y_CODE"], errors="coerce").astype(np.float32)
     df = df.dropna(subset=["X_CODE", "Y_CODE"]).reset_index(drop=True)
-    df["CITY_NAME"] = df["CITY_NAME"].astype(str)
+    df["CITY_NAME"] = df.get("CITY_NAME", "").fillna("").astype(str)
 
-    pref_candidates = ["PREF_NAME", "KEN_NAME", "都道府県名", "都道府県"]
-    found_pref_col = next((c for c in pref_candidates if c in df.columns), None)
-    code_candidates = ["PREF", "KEN", "JIS_CODE", "KEY_CODE", "CITY_CODE"]
+    code_candidates = ["PREF_CODE", "CITY_CODE", "KEY_CODE"]
     found_code_col = next((c for c in code_candidates if c in df.columns), None)
 
-    if found_pref_col and df[found_pref_col].notna().any():
-        pref_series = df[found_pref_col].fillna("").astype(str)
-    elif found_code_col:
-        codes = df[found_code_col].astype(str).str.zfill(5).str[:2]
+    pref_from_code = pd.Series("", index=df.index, dtype=str)
+    if found_code_col:
+        codes2 = (
+            df[found_code_col]
+            .astype(str)
+            .str.extract(r"(\d+)")[0]
+            .fillna("")
+            .str.zfill(5)
+            .str[:2]
+        )
         code_map = {f"{i+1:02d}": PREF_LIST[i] for i in range(47)}
-        pref_series = codes.map(code_map).fillna("")
+        pref_from_code = codes2.map(code_map).fillna("")
+
+    if "PREF_NAME" in df.columns:
+        raw_pref = df["PREF_NAME"].fillna("").astype(str).str.strip()
+        pref_series = pd.Series(
+            np.where(pref_from_code != "", pref_from_code, raw_pref),
+            index=df.index,
+            dtype=str,
+        )
     else:
-        pref_series = pd.Series("", index=df.index, dtype=str)
+        pref_series = pref_from_code
 
     if (pref_series == "").any():
-        city_coords = df.groupby("CITY_NAME", observed=True)[["Y_CODE", "X_CODE"]].mean()
-        coords = city_coords.values[:, None, :]
-        dists = ((coords - PREF_CENTERS[None, :, :]) ** 2).sum(axis=2)
-        nearest_idx = dists.argmin(axis=1)
-        city_to_pref = dict(zip(city_coords.index, [PREF_LIST[i] for i in nearest_idx]))
-        mask_empty = pref_series == ""
-        pref_series.loc[mask_empty] = df.loc[mask_empty, "CITY_NAME"].map(city_to_pref)
+        valid_city = df[df["CITY_NAME"] != ""]
+        if len(valid_city) > 0:
+            city_coords = valid_city.groupby("CITY_NAME", observed=True)[["Y_CODE", "X_CODE"]].mean()
+            coords = city_coords.values[:, None, :]
+            dists = ((coords - PREF_CENTERS[None, :, :]) ** 2).sum(axis=2)
+            nearest_idx = dists.argmin(axis=1)
+            city_to_pref = dict(zip(city_coords.index, [PREF_LIST[i] for i in nearest_idx]))
+            mask_empty = (pref_series == "") & (df["CITY_NAME"] != "")
+            pref_series.loc[mask_empty] = df.loc[mask_empty, "CITY_NAME"].map(city_to_pref).fillna("")
 
     df["PREF_NAME"] = pref_series.astype("category")
     df["CITY_NAME"] = df["CITY_NAME"].astype("category")
     if "S_NAME" in df.columns:
         df["S_NAME"] = df["S_NAME"].fillna("不明").astype("category")
+    else:
+        df["S_NAME"] = pd.Series("不明", index=df.index, dtype="category")
 
-    del pref_series
+    for drop_c in ["PREF_CODE", "CITY_CODE", "KEY_CODE"]:
+        if drop_c in df.columns:
+            df.drop(columns=[drop_c], inplace=True)
+
+    del pref_series, pref_from_code
     gc.collect()
     return df
 
 
 @st.cache_data(show_spinner=False)
-def load_boundaries():
+def load_boundaries(geojson_file_id: str):
     output = "admin_boundaries_slim.geojson"
     if not os.path.exists(output):
-        url = f"https://drive.google.com/uc?id={GEOJSON_FILE_ID}"
+        url = f"https://drive.google.com/uc?id={geojson_file_id}"
         gdown.download(url, output, quiet=True)
 
     if not os.path.exists(output):
@@ -141,7 +174,15 @@ def load_boundaries():
     return {"type": "FeatureCollection", "features": []}
 
 
-def filter_boundary_features(boundaries_data, selected_pref, pref_kw, selected_city, city_kw, available_prefs, city_candidates):
+def filter_boundary_features(
+    boundaries_data,
+    selected_pref,
+    pref_kw,
+    selected_city,
+    city_kw,
+    available_prefs,
+    city_candidates,
+):
     features = boundaries_data.get("features", [])
     matched = []
 
@@ -159,8 +200,8 @@ def filter_boundary_features(boundaries_data, selected_pref, pref_kw, selected_c
 
     for feat in features:
         props = feat.get("properties") or {}
-        p_val = str(props.get("PREF_NAME") or props.get("N03_001") or "")
-        c_val = str(props.get("CITY_NAME") or props.get("N03_004") or "")
+        p_val = str(props.get("PREF_NAME") or props.get("N03_001") or "").strip()
+        c_val = str(props.get("CITY_NAME") or props.get("N03_004") or "").strip()
 
         if matched_cities:
             if c_val in matched_cities and (not matched_prefs or p_val in matched_prefs):
@@ -179,7 +220,7 @@ def add_base_tiles(m):
         name="国土地理院 淡色地図",
         overlay=False,
         control=True,
-        max_zoom=18
+        max_zoom=18,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
@@ -187,178 +228,173 @@ def add_base_tiles(m):
         name="国土地理院 標準地図",
         overlay=False,
         control=True,
-        max_zoom=18
+        max_zoom=18,
     ).add_to(m)
 
 
 with st.spinner("軽量データと行政界データを読み込んでいます..."):
-    df = load_data()
-    boundaries_data = load_boundaries()
+    df = load_data(PARQUET_FILE_ID)
+    boundaries_data = load_boundaries(GEOJSON_FILE_ID)
 
 st.sidebar.header("🔍 エリア絞り込み")
 
-pref_keyword = st.sidebar.text_input(
-    "都道府県を文字で絞り込み",
-    placeholder="例：北海道、東京都、新潟県"
-)
+if st.sidebar.button("キャッシュ再取得（データ更新時）"):
+    for fname in ["small_area_slim.parquet", "admin_boundaries_slim.geojson"]:
+        if os.path.exists(fname):
+            os.remove(fname)
+    st.cache_data.clear()
+    st.rerun()
 
-existing_prefs = set(df["PREF_NAME"].cat.categories)
-available_prefs = [p for p in PREF_LIST if p in existing_prefs]
-filtered_prefs = [p for p in available_prefs if pref_keyword.strip() in p] if pref_keyword.strip() else available_prefs
-selected_pref = st.sidebar.selectbox("都道府県を選択", ["（すべて）"] + filtered_prefs, index=0)
+pref_keyword = st.sidebar.text_input("都道府県を文字で絞り込み", placeholder="例：新潟県、北海道")
 
-city_keyword = st.sidebar.text_input(
-    "市区町村を文字で絞り込み（都道府県未選択でも可）",
-    placeholder="例：札幌市、新宿区、新潟市"
-)
+available_prefs = [p for p in PREF_LIST if p in set(df["PREF_NAME"].dropna().astype(str).unique())]
+if not available_prefs:
+    available_prefs = sorted([p for p in df["PREF_NAME"].dropna().astype(str).unique() if p != ""])
+
+pref_options = ["（すべて）"] + [
+    p for p in available_prefs if not pref_keyword.strip() or pref_keyword.strip() in p
+]
+selected_pref = st.sidebar.selectbox("都道府県を選択", pref_options, index=0)
+
+city_keyword = st.sidebar.text_input("市区町村を文字で絞り込み", placeholder="例：上越市、新潟市")
 
 if selected_pref != "（すべて）":
-    city_candidates = sorted(df.loc[df["PREF_NAME"] == selected_pref, "CITY_NAME"].unique().tolist())
+    pref_filtered_df = df[df["PREF_NAME"].astype(str) == selected_pref]
+elif pref_keyword.strip():
+    matched_p = [p for p in available_prefs if pref_keyword.strip() in p]
+    pref_filtered_df = df[df["PREF_NAME"].astype(str).isin(matched_p)]
 else:
-    city_candidates = sorted(df["CITY_NAME"].cat.categories.tolist())
+    pref_filtered_df = df
 
-filtered_cities = [c for c in city_candidates if city_keyword.strip() in c] if city_keyword.strip() else city_candidates
-selected_city = st.sidebar.selectbox("市区町村を選択", ["（すべて）"] + filtered_cities, index=0)
+city_candidates = sorted(
+    [c for c in pref_filtered_df["CITY_NAME"].dropna().astype(str).unique() if c != ""]
+)
+city_options = ["（すべて）"] + [
+    c for c in city_candidates if not city_keyword.strip() or city_keyword.strip() in c
+]
+selected_city = st.sidebar.selectbox("市区町村を選択", city_options, index=0)
 
-st.sidebar.caption("行政界：都道府県/市区町村ポリゴン / 拡大（ズーム13以上）でグリッド＋ポップアップ")
-
-has_area_filter = (
+is_filtered = (
     selected_pref != "（すべて）"
-    or selected_city != "（すべて）"
     or bool(pref_keyword.strip())
+    or selected_city != "（すべて）"
     or bool(city_keyword.strip())
 )
 
-is_city_selected = (selected_city != "（すべて）") or bool(city_keyword.strip())
-
-mask = pd.Series(True, index=df.index)
-if selected_pref != "（すべて）":
-    mask &= (df["PREF_NAME"] == selected_pref)
-elif pref_keyword.strip():
-    matched_p = [p for p in available_prefs if pref_keyword.strip() in p]
-    mask &= df["PREF_NAME"].isin(matched_p)
-
+filtered_df = pref_filtered_df.copy()
 if selected_city != "（すべて）":
-    mask &= (df["CITY_NAME"] == selected_city)
+    filtered_df = filtered_df[filtered_df["CITY_NAME"].astype(str) == selected_city]
 elif city_keyword.strip():
     matched_c = [c for c in city_candidates if city_keyword.strip() in c]
-    mask &= df["CITY_NAME"].isin(matched_c)
+    filtered_df = filtered_df[filtered_df["CITY_NAME"].astype(str).isin(matched_c)]
 
-target_df = df.loc[mask]
-
-total_jinko = int(target_df["JINKO"].sum())
-total_setai = int(target_df["SETAI"].sum())
-area_label = (
-    f"{selected_pref} / {selected_city}"
-    if selected_pref != "（すべて）" and selected_city != "（すべて）"
-    else (selected_city if selected_city != "（すべて）" else (selected_pref if selected_pref != "（すべて）" else "全国"))
-)
-
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("対象エリア", area_label)
-col2.metric("総人口", f"{total_jinko:,} 人")
-col3.metric("総世帯数", f"{total_setai:,} 世帯")
-col4.metric("対象エリア数", f"{len(target_df):,} 件")
-
-st.markdown("---")
-
-if not has_area_filter:
-    st.info("左のサイドバーから「都道府県」または「市区町村」を選択・入力すると、対象エリアの行政界とヒートマップが表示されます。")
-    m = folium.Map(location=[36.5, 138.0], zoom_start=5, tiles=None)
-    add_base_tiles(m)
-    folium.LayerControl().add_to(m)
-    st_folium(m, width="100%", height=650, returned_objects=[])
-    del m
-    gc.collect()
-elif not target_df.empty:
-    center_lat = float(target_df["Y_CODE"].median())
-    center_lon = float(target_df["X_CODE"].median())
-    zoom_start = 13 if is_city_selected else 8
-
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None)
-    add_base_tiles(m)
-
-    # 1. 実際の都道府県・市区町村の行政界ポリゴン
-    matched_fc = filter_boundary_features(
-        boundaries_data,
-        selected_pref,
-        pref_keyword,
-        selected_city,
-        city_keyword,
-        available_prefs,
-        city_candidates,
-    )
-    if matched_fc["features"]:
-        folium.GeoJson(
-            matched_fc,
-            name="行政界（都道府県・市区町村）",
-            style_function=lambda _: {
-                "color": "#c0392b",
-                "weight": 2.0,
-                "opacity": 0.9,
-                "fillColor": "#c0392b",
-                "fillOpacity": 0.04,
-            },
-            tooltip=folium.GeoJsonTooltip(
-                fields=[k for k in ["PREF_NAME", "CITY_NAME"] if any(k in (f.get("properties") or {}) for f in matched_fc["features"])],
-                aliases=["都道府県", "市区町村"],
-                localize=True,
-            ),
-        ).add_to(m)
-
-    # 2. ヒートマップレイヤー（広域ズーム用）
-    fg_heat = folium.FeatureGroup(name="広域ヒートマップ", show=True)
-    max_hm = 10000
-    hm_df = target_df if len(target_df) <= max_hm else target_df.sample(max_hm, random_state=42)
-    heat_data = list(zip(
-        hm_df["Y_CODE"].astype(float).tolist(),
-        hm_df["X_CODE"].astype(float).tolist(),
-        np.maximum(hm_df["JINKO"].astype(float).values, 1.0).tolist()
-    ))
-    HeatMap(
-        heat_data,
-        radius=18 if len(hm_df) > 3000 else 22,
-        blur=15,
-        max_zoom=18,
-        gradient={0.2: "cyan", 0.4: "lime", 0.65: "yellow", 0.85: "orange", 1.0: "red"}
-    ).add_to(fg_heat)
-    fg_heat.add_to(m)
-
-    # 3. グリッドレイヤー（拡大ズーム13以上用・クリックで地図内ポップアップ表示）
-    fg_grid = folium.FeatureGroup(name="詳細グリッド", show=False)
-    max_grid = 2500
-    if len(target_df) <= max_grid:
-        grid_df = target_df
-    else:
-        grid_df = target_df.nlargest(max_grid, "JINKO")
-
-    dlat, dlon = 0.0006, 0.0008
-    for row in grid_df.itertuples():
-        lat, lon = float(row.Y_CODE), float(row.X_CODE)
-        jinko, setai = int(row.JINKO), int(row.SETAI)
-        s_name = str(row.S_NAME) if hasattr(row, "S_NAME") else "不明"
-        city_n = str(row.CITY_NAME)
-
-        fill_col = "#e31a1c" if jinko >= 500 else ("#fd8d3c" if jinko >= 200 else ("#fecc5c" if jinko >= 50 else "#ffffb2"))
-        popup_html = f"<b>{city_n} {s_name}</b><br>人口: {jinko:,}人<br>世帯: {setai:,}世帯"
-
-        folium.Rectangle(
-            bounds=[[lat - dlat, lon - dlon], [lat + dlat, lon + dlon]],
-            color="#e67e22",
-            weight=0.6,
-            fill=True,
-            fill_color=fill_col,
-            fill_opacity=0.65,
-            tooltip=f"{city_n} {s_name}（人口: {jinko:,}人）",
-            popup=folium.Popup(popup_html, max_width=250)
-        ).add_to(fg_grid)
-    fg_grid.add_to(m)
-
-    m.get_root().add_child(ZoomHeatGridSwitcher(fg_heat, fg_grid, zoom_threshold=13))
-
-    folium.LayerControl().add_to(m)
-    st_folium(m, width="100%", height=650, returned_objects=[])
-    del m
-    gc.collect()
+if not is_filtered:
+    area_label = "未選択（日本広域）"
+    total_pop = 0
+    total_households = 0
+    area_count = 0
 else:
-    st.warning("条件に一致するエリアデータがありません。絞り込み条件を変更してください。")
+    if selected_city != "（すべて）":
+        area_label = f"{selected_pref} {selected_city}" if selected_pref != "（すべて）" else selected_city
+    elif selected_pref != "（すべて）":
+        area_label = selected_pref
+    else:
+        area_label = "条件一致エリア"
+    total_pop = int(filtered_df["JINKO"].sum())
+    total_households = int(filtered_df["SETAI"].sum())
+    area_count = int(len(filtered_df))
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("対象エリア", area_label)
+m2.metric("総人口", f"{total_pop:,} 人")
+m3.metric("総世帯数", f"{total_households:,} 世帯")
+m4.metric("対象エリア数", f"{area_count:,} 件")
+
+if is_filtered and len(filtered_df) > 0:
+    center_lat = float(filtered_df["Y_CODE"].mean())
+    center_lon = float(filtered_df["X_CODE"].mean())
+    zoom_start = 11 if selected_city != "（すべて）" else 9
+else:
+    center_lat, center_lon = 36.5, 138.0
+    zoom_start = 5
+
+m = folium.Map(location=[center_lat, center_lon], zoom_start=zoom_start, tiles=None, control_scale=True)
+add_base_tiles(m)
+
+matched_boundaries = filter_boundary_features(
+    boundaries_data,
+    selected_pref,
+    pref_keyword,
+    selected_city,
+    city_keyword,
+    available_prefs,
+    city_candidates,
+)
+if is_filtered and matched_boundaries["features"]:
+    folium.GeoJson(
+        matched_boundaries,
+        name="行政界ポリゴン",
+        style_function=lambda _: {
+            "color": "#1f4e78",
+            "weight": 2,
+            "fillColor": "#4a90e2",
+            "fillOpacity": 0.08,
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=[
+                k for k in ["PREF_NAME", "CITY_NAME"]
+                if k in (matched_boundaries["features"][0].get("properties") or {})
+            ],
+            aliases=["都道府県", "市区町村"],
+            localize=True,
+        ),
+    ).add_to(m)
+
+if is_filtered and len(filtered_df) > 0:
+    if len(filtered_df) > MAX_HEATMAP_POINTS:
+        st.caption(f"※描画サイズ抑制のため、ヒートマップは {len(filtered_df):,} 件から {MAX_HEATMAP_POINTS:,} 件を抽出して表示しています。")
+        heat_df = filtered_df.sample(n=MAX_HEATMAP_POINTS, random_state=42)
+    else:
+        heat_df = filtered_df
+
+    heat_group = folium.FeatureGroup(name="人口ヒートマップ", show=True)
+    heat_points = [
+        [float(row.Y_CODE), float(row.X_CODE), max(float(row.JINKO), 1.0)]
+        for row in heat_df.itertuples(index=False)
+    ]
+    if heat_points:
+        HeatMap(heat_points, radius=16, blur=18, max_zoom=13).add_to(heat_group)
+    heat_group.add_to(m)
+
+    grid_group = folium.FeatureGroup(name="詳細グリッド（ズーム13以上）", show=False)
+    half_lat = 0.0006
+    half_lon = 0.00075
+    for row in filtered_df.iloc[:MAX_GRID_POINTS].itertuples(index=False):
+        lat = float(row.Y_CODE)
+        lon = float(row.X_CODE)
+        s_name = getattr(row, "S_NAME", "不明")
+        c_name = getattr(row, "CITY_NAME", "")
+        jinko_val = int(getattr(row, "JINKO", 0))
+        setai_val = int(getattr(row, "SETAI", 0))
+        popup_html = (
+            f"<b>{c_name} {s_name}</b><br>"
+            f"人口: {jinko_val:,} 人<br>"
+            f"世帯数: {setai_val:,} 世帯"
+        )
+        folium.Rectangle(
+            bounds=[[lat - half_lat, lon - half_lon], [lat + half_lat, lon + half_lon]],
+            color="#d95f02",
+            weight=1,
+            fill=True,
+            fill_opacity=0.25,
+            popup=folium.Popup(popup_html, max_width=250),
+        ).add_to(grid_group)
+    grid_group.add_to(m)
+
+    ZoomHeatGridSwitcher(heat_group, grid_group, zoom_threshold=13).add_to(m)
+
+    del heat_df, heat_points
+    gc.collect()
+
+folium.LayerControl(collapsed=True).add_to(m)
+st_folium(m, width="100%", height=620, returned_objects=[])
